@@ -1,0 +1,7 @@
+/build/
+/out/
+/models/
+*.user
+.vs/
+__pycache__/
+/out-*.log

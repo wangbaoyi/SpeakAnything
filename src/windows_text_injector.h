@@ -1,0 +1,34 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string_view>
+
+struct WindowsTextInputTargetState;
+
+struct WindowsTextInputTarget {
+    std::uintptr_t window = 0;
+    std::uintptr_t focus = 0;
+    std::shared_ptr<WindowsTextInputTargetState> state;
+    std::uint32_t process_id = 0;
+    std::uint32_t thread_id = 0;
+
+    [[nodiscard]] bool valid() const {
+        return window != 0;
+    }
+};
+
+WindowsTextInputTarget capture_windows_text_input_target(std::uint32_t excluded_process_id);
+bool windows_text_input_target_has_tsf_session(const WindowsTextInputTarget& target);
+// paste_safe is set when the failure is definite, i.e. nothing may have been
+// typed, so falling back to a clipboard paste cannot duplicate the text.
+bool inject_text_into_windows_text_input(
+    WindowsTextInputTarget target,
+    std::wstring_view text,
+    std::uint32_t excluded_process_id,
+    bool* paste_safe = nullptr);
+
+// Brings the target forward and sends Ctrl+V; the clipboard must already hold the text.
+bool paste_clipboard_into_windows_text_input(
+    WindowsTextInputTarget target,
+    std::uint32_t excluded_process_id);
