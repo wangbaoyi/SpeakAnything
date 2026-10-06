@@ -21,7 +21,8 @@ SpeakAnything is distributed under the GNU AGPL-3.0 (see `LICENSE`). It includes
 
 | Model | Source | License |
 | --- | --- | --- |
-| SenseVoiceSmall (Q8 GGUF) | [FunAudioLLM/SenseVoice](https://github.com/FunAudioLLM/SenseVoice) | See upstream model license |
-| FSMN-VAD (GGUF) | [FunASR](https://github.com/modelscope/FunASR) | See upstream model license |
-| Opus-MT zh-en / en-zh (CTranslate2 int8) | [Helsinki-NLP](https://huggingface.co/Helsinki-NLP) | CC-BY-4.0 |
+| SenseVoiceSmall (Q8 GGUF) | [FunAudioLLM/SenseVoiceSmall-GGUF](https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF) | Apache-2.0 |
+| FSMN-VAD (GGUF) | [FunAudioLLM/fsmn-vad-GGUF](https://huggingface.co/FunAudioLLM/fsmn-vad-GGUF) | Apache-2.0 |
+| Opus-MT zh-en (CTranslate2 int8) | [Helsinki-NLP/opus-mt-zh-en](https://huggingface.co/Helsinki-NLP/opus-mt-zh-en) | CC-BY-4.0 |
+| Opus-MT en-zh (CTranslate2 int8) | [Helsinki-NLP/opus-mt-en-zh](https://huggingface.co/Helsinki-NLP/opus-mt-en-zh) | Apache-2.0 |
 | Kokoro-82M v1.1 multi-lang | [hexgrad/Kokoro-82M-v1.1-zh](https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh), packaged by sherpa-onnx | Apache-2.0 |
