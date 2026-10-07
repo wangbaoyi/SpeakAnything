@@ -8,12 +8,23 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#ifdef SENSEVOICE_WITH_COREML
+#include "macos/coreml_sensevoice.h"
+
+#include <sentencepiece_processor.h>
+
+#include <fstream>
+#include <sstream>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -271,8 +282,17 @@ ggml_tensor* sanm_attention(
 
     const int padding = (kernel - 1) / 2;
     ggml_tensor* fsmn_kernel = model.get(prefix + "fsmn_block.weight");
-    ggml_tensor* padded_value = ggml_pad_ext(
-        context, value, 0, 0, padding, padding, 0, 0, 0, 0);
+    // Zero-pad the frame axis on both sides. Metal only pads on the right, so
+    // the left zeros are a scaled-by-zero slice concatenated in front; the
+    // result is identical to ggml_pad_ext on every backend.
+    ggml_tensor* padded_value = nullptr;
+    if (frames >= padding) {
+        ggml_tensor* left_zeros = ggml_scale(
+            context, ggml_view_2d(context, value, dimension, padding, value->nb[1], 0), 0.0F);
+        padded_value = ggml_concat(context, left_zeros, ggml_pad(context, value, 0, padding, 0, 0), 1);
+    } else {
+        padded_value = ggml_pad_ext(context, value, 0, 0, padding, padding, 0, 0, 0, 0);
+    }
     ggml_tensor* fsmn = value;
     for (int tap = 0; tap < kernel; ++tap) {
         ggml_tensor* slice = ggml_view_2d(
@@ -409,6 +429,36 @@ std::string detokenize(
     return trim_spaces(result);
 }
 
+// SenseVoice reports a laugh as a <|Laughter|> event, not as text, so a
+// laugh would vanish from both the input and the spoken translation. Put it
+// back as words the translator and the voice can carry.
+std::string with_laughter(
+    std::string text,
+    const std::vector<int>& token_ids,
+    const std::vector<std::string>& vocabulary) {
+    bool laughed = false;
+    for (const int token_id : token_ids) {
+        if (token_id >= 0 && token_id < static_cast<int>(vocabulary.size()) &&
+            vocabulary[token_id] == "<|Laughter|>") {
+            laughed = true;
+            break;
+        }
+    }
+    if (!laughed) return text;
+    for (const char* written : {"哈", "呵", "嘿", "ha", "Ha", "HA", "he", "He"}) {
+        if (text.find(written) != std::string::npos) return text;
+    }
+    bool latin = false;
+    for (const char character : text) {
+        if ((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')) {
+            latin = true;
+            break;
+        }
+    }
+    if (text.empty()) return "哈哈";
+    return latin ? "Haha, " + text : "哈哈，" + text;
+}
+
 } // namespace
 
 struct SenseVoiceEngine::Impl {
@@ -426,6 +476,19 @@ struct SenseVoiceEngine::Impl {
     std::unordered_map<std::string, std::vector<int>> hotword_token_cache;
     int threads = 8;
     bool is_loaded = false;
+    // Metal (Apple GPU) view of the same weights; compute falls back to the
+    // CPU backend when unavailable or when the graph uses an op it lacks.
+    ggml_backend_t gpu_backend = nullptr;
+    ggml_backend_buffer_t gpu_weights = nullptr;
+    bool use_gpu = false;
+    // SenseVoice language query id: 0 auto, 3 zh, 4 en, 7 yue, 11 ja, 12 ko.
+    int language_id = 0;
+    bool gpu_checked = false;
+#ifdef SENSEVOICE_WITH_COREML
+    std::unique_ptr<CoreMLSenseVoice> coreml;
+    std::vector<float> cmvn_shift;
+    std::vector<float> cmvn_scale;
+#endif
 
     static bool matches_piece(std::string_view phrase, std::size_t position, std::string_view piece) {
         if (position + piece.size() > phrase.size()) {
@@ -506,7 +569,50 @@ struct SenseVoiceEngine::Impl {
         return result;
     }
 
+    // Unified memory: wrap the already-loaded weights in a GPU buffer in place.
+    void try_enable_gpu() {
+#ifdef __APPLE__
+        if (gpu_disabled()) return;
+        ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (device == nullptr || model.weights_context == nullptr) return;
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(device, &props);
+        if (!props.caps.buffer_from_host_ptr) return;
+        size_t largest = 0;
+        for (ggml_tensor* tensor = ggml_get_first_tensor(model.weights_context); tensor != nullptr;
+             tensor = ggml_get_next_tensor(model.weights_context, tensor)) {
+            largest = std::max(largest, ggml_nbytes(tensor));
+        }
+        gpu_weights = ggml_backend_dev_buffer_from_host_ptr(
+            device, ggml_get_mem_buffer(model.weights_context),
+            ggml_get_mem_size(model.weights_context), largest);
+        if (gpu_weights == nullptr) return;
+        gpu_backend = ggml_backend_dev_init(device, nullptr);
+        if (gpu_backend == nullptr) {
+            ggml_backend_buffer_free(gpu_weights);
+            gpu_weights = nullptr;
+            return;
+        }
+        for (ggml_tensor* tensor = ggml_get_first_tensor(model.weights_context); tensor != nullptr;
+             tensor = ggml_get_next_tensor(model.weights_context, tensor)) {
+            tensor->buffer = gpu_weights;
+        }
+        use_gpu = true;
+#endif
+    }
+
+    static bool gpu_disabled() {
+        const char* value = std::getenv("SENSEVOICE_NO_GPU");
+        return value != nullptr && value[0] == '1';
+    }
+
     ~Impl() {
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
+        }
+        if (gpu_weights != nullptr) {
+            ggml_backend_buffer_free(gpu_weights);
+        }
         if (backend != nullptr) {
             ggml_backend_free(backend);
         }
@@ -528,6 +634,11 @@ bool SenseVoiceEngine::load(
         error = "SenseVoice model is already loaded";
         return false;
     }
+#ifdef SENSEVOICE_WITH_COREML
+    if (std::filesystem::is_directory(model_path)) {
+        return load_coreml(model_path, error);
+    }
+#endif
 
     impl_->backend = ggml_backend_cpu_init();
     if (impl_->backend == nullptr) {
@@ -605,12 +716,45 @@ bool SenseVoiceEngine::load(
 
     impl_->threads = std::max(1, threads);
     ggml_backend_cpu_set_n_threads(impl_->backend, impl_->threads);
+    impl_->try_enable_gpu();
     impl_->is_loaded = true;
+    if (impl_->use_gpu) {
+        // Settles GPU-vs-CPU (op support) and compiles the Metal kernels now,
+        // so the first dictation isn't the slow one.
+        const std::vector<float> silence(sample_rate, 0.0F);
+        try {
+            recognize(silence);
+        } catch (const std::exception&) {
+            impl_->use_gpu = false;
+        }
+    }
     return true;
 }
 
 bool SenseVoiceEngine::loaded() const {
     return impl_->is_loaded;
+}
+
+void SenseVoiceEngine::set_language(const std::string& language) {
+    static const std::pair<const char*, int> ids[] = {
+        {"zh", 3}, {"en", 4}, {"yue", 7}, {"ja", 11}, {"ko", 12}};
+    impl_->language_id = 0;
+    for (const auto& [code, id] : ids) {
+        if (language == code) impl_->language_id = id;
+    }
+    // GGUF builds read the query from query_tokens; its first slot is the language.
+    if (!impl_->query_tokens.empty()) impl_->query_tokens[0] = impl_->language_id;
+}
+
+void SenseVoiceEngine::reset() {
+    impl_ = std::make_unique<Impl>();
+}
+
+const char* SenseVoiceEngine::device() const {
+#ifdef SENSEVOICE_WITH_COREML
+    if (impl_->coreml != nullptr) return "Neural Engine";
+#endif
+    return impl_->use_gpu ? "GPU (Metal)" : "CPU";
 }
 
 SenseVoiceResult SenseVoiceEngine::recognize(
@@ -628,6 +772,11 @@ SenseVoiceResult SenseVoiceEngine::recognize(
         return result;
     }
 
+#ifdef SENSEVOICE_WITH_COREML
+    if (impl_->coreml != nullptr) {
+        return recognize_coreml(std::move(features), feature_frames, hotwords, result);
+    }
+#endif
     const auto started = std::chrono::steady_clock::now();
     const int query_count = static_cast<int>(impl_->query_tokens.size());
     const int total_frames = query_count + feature_frames;
@@ -712,12 +861,28 @@ SenseVoiceResult SenseVoiceEngine::recognize(
 
         ggml_cgraph* graph = ggml_new_graph_custom(context, 32'768, false);
         ggml_build_forward_expand(graph, logits);
-        allocator = ggml_gallocr_new(impl_->buffer_type);
+        if (impl_->use_gpu && !impl_->gpu_checked) {
+            impl_->gpu_checked = true;
+            for (int index = 0; index < ggml_graph_n_nodes(graph); ++index) {
+                if (!ggml_backend_supports_op(impl_->gpu_backend, ggml_graph_node(graph, index))) {
+                    if (std::getenv("SENSEVOICE_DEBUG_GPU") != nullptr) {
+                        ggml_tensor* node = ggml_graph_node(graph, index);
+                        std::fprintf(stderr, "Metal lacks %s (%s) type %s src0 %s\n", ggml_op_desc(node), node->name,
+                            ggml_type_name(node->type), node->src[0] ? ggml_type_name(node->src[0]->type) : "-");
+                        continue;
+                    }
+                    impl_->use_gpu = false;
+                    break;
+                }
+            }
+        }
+        ggml_backend_t compute_backend = impl_->use_gpu ? impl_->gpu_backend : impl_->backend;
+        allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(compute_backend));
         if (!ggml_gallocr_alloc_graph(allocator, graph)) {
             throw std::runtime_error("failed to allocate SenseVoice compute graph");
         }
         ggml_backend_tensor_set(graph_input, input.data(), 0, ggml_nbytes(graph_input));
-        if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
+        if (ggml_backend_graph_compute(compute_backend, graph) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("SenseVoice graph computation failed");
         }
 
@@ -739,7 +904,8 @@ SenseVoiceResult SenseVoiceEngine::recognize(
             vocabulary_size,
             impl_->model.config.blank_id,
             encoded_hotwords);
-        result.text = detokenize(decoded.token_ids, impl_->vocabulary);
+        result.text = with_laughter(
+            detokenize(decoded.token_ids, impl_->vocabulary), decoded.token_ids, impl_->vocabulary);
         result.hotword_bias_applied = decoded.used_hotword_bias;
     } catch (...) {
         if (allocator != nullptr) {
@@ -757,3 +923,101 @@ SenseVoiceResult SenseVoiceEngine::recognize(
             .count());
     return result;
 }
+
+#ifdef SENSEVOICE_WITH_COREML
+
+namespace {
+
+// am.mvn is a Kaldi nnet text file; the vectors after <AddShift> and
+// <Rescale> are the per-dimension shift and scale.
+bool read_cmvn(const std::filesystem::path& path, std::vector<float>& shift,
+               std::vector<float>& scale) {
+    std::ifstream file(path);
+    std::string line;
+    std::vector<float>* pending = nullptr;
+    while (std::getline(file, line)) {
+        if (line.find("<AddShift>") != std::string::npos) pending = &shift;
+        else if (line.find("<Rescale>") != std::string::npos) pending = &scale;
+        else if (pending != nullptr && line.find("<LearnRateCoef>") != std::string::npos) {
+            const std::size_t open = line.find('[');
+            const std::size_t close = line.find(']');
+            std::istringstream values(line.substr(open + 1, close - open - 1));
+            float value = 0.0F;
+            while (values >> value) pending->push_back(value);
+            pending = nullptr;
+        }
+    }
+    return !shift.empty() && shift.size() == scale.size();
+}
+
+} // namespace
+
+// model_directory holds sensevoice.mlpackage, am.mvn and the SentencePiece
+// model from FunAudioLLM/SenseVoiceSmall.
+bool SenseVoiceEngine::load_coreml(const std::filesystem::path& model_directory,
+                                   std::string& error) {
+    if (!read_cmvn(model_directory / "am.mvn", impl_->cmvn_shift, impl_->cmvn_scale) ||
+        impl_->cmvn_shift.size() < static_cast<std::size_t>(feature_dimension)) {
+        error = "missing or invalid am.mvn in " + model_directory.string();
+        return false;
+    }
+    sentencepiece::SentencePieceProcessor tokenizer;
+    if (!tokenizer.Load((model_directory / "chn_jpn_yue_eng_ko_spectok.bpe.model").string()).ok()) {
+        error = "failed to load the SenseVoice tokenizer";
+        return false;
+    }
+    impl_->vocabulary.resize(static_cast<std::size_t>(tokenizer.GetPieceSize()));
+    for (int id = 0; id < tokenizer.GetPieceSize(); ++id) {
+        impl_->vocabulary[static_cast<std::size_t>(id)] = tokenizer.IdToPiece(id);
+    }
+    impl_->model.config.vocabulary_size = static_cast<int>(impl_->vocabulary.size());
+    impl_->model.config.blank_id = 0;
+    impl_->prepare_hotword_vocabulary();
+
+    auto coreml = std::make_unique<CoreMLSenseVoice>();
+    if (!coreml->load(model_directory / "sensevoice.mlpackage", error)) return false;
+    impl_->coreml = std::move(coreml);
+    impl_->is_loaded = true;
+    return true;
+}
+
+SenseVoiceResult SenseVoiceEngine::recognize_coreml(
+    std::vector<float> features,
+    int frames,
+    std::span<const HotwordBoostPhrase> hotwords,
+    SenseVoiceResult result) {
+    // Same queries as the GGUF build: the chosen language (auto unless
+    // set_language picked one) and text normalization withitn (14).
+    constexpr int style_with_itn = 14;
+    const auto started = std::chrono::steady_clock::now();
+    for (int time = 0; time < frames; ++time) {
+        float* row = &features[static_cast<std::size_t>(time) * feature_dimension];
+        for (int index = 0; index < feature_dimension; ++index) {
+            row[index] = (row[index] + impl_->cmvn_shift[index]) * impl_->cmvn_scale[index];
+        }
+    }
+    std::vector<float> logits;
+    int vocabulary_size = 0;
+    std::string error;
+    if (!impl_->coreml->run(features, frames, impl_->language_id, style_with_itn, logits,
+                            vocabulary_size, error)) {
+        throw std::runtime_error(error);
+    }
+    std::vector<CtcHotword> encoded_hotwords;
+    for (const HotwordBoostPhrase& hotword : hotwords) {
+        std::vector<int> token_ids = impl_->tokenize_hotword(hotword.phrase);
+        if (token_ids.size() >= 2 && hotword.boost > 0.0F) {
+            encoded_hotwords.push_back({std::move(token_ids), hotword.boost});
+        }
+    }
+    const CtcHotwordDecodeResult decoded = decode_ctc_with_hotword_bias(
+        logits, frames + 4, vocabulary_size, 0, encoded_hotwords);
+    result.text = with_laughter(
+        detokenize(decoded.token_ids, impl_->vocabulary), decoded.token_ids, impl_->vocabulary);
+    result.hotword_bias_applied = decoded.used_hotword_bias;
+    result.inference_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count());
+    return result;
+}
+
+#endif

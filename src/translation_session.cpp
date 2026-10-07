@@ -1,5 +1,7 @@
 #include "translation_session.h"
 
+#include "languages.h"
+
 #include <algorithm>
 
 namespace {
@@ -67,18 +69,25 @@ TextLanguage detect_text_language(std::string_view text) {
     return cjk >= latin_words ? TextLanguage::Chinese : TextLanguage::English;
 }
 
-TextLanguage source_language(TranslationDirection direction) {
-    return direction == TranslationDirection::ZhToEn ? TextLanguage::Chinese : TextLanguage::English;
+TextLanguage source_language(const TranslationDirection& direction) {
+    if (direction.source == "zh" || direction.source == "yue") return TextLanguage::Chinese;
+    if (direction.source == "en") return TextLanguage::English;
+    return TextLanguage::Unknown;
 }
 
-const char* direction_code(TranslationDirection direction) {
-    return direction == TranslationDirection::ZhToEn ? "zh-en" : "en-zh";
+std::string direction_code(const TranslationDirection& direction) {
+    return direction.source + "-" + direction.target;
 }
 
 std::optional<TranslationDirection> parse_direction_code(std::string_view code) {
-    if (code == "zh-en") return TranslationDirection::ZhToEn;
-    if (code == "en-zh") return TranslationDirection::EnToZh;
-    return std::nullopt;
+    const std::size_t dash = code.find('-');
+    if (dash == std::string_view::npos) return std::nullopt;
+    const std::string_view source = code.substr(0, dash);
+    const std::string_view target = code.substr(dash + 1);
+    if (find_language(source) == nullptr || find_language(target) == nullptr || source == target) {
+        return std::nullopt;
+    }
+    return TranslationDirection{std::string(source), std::string(target)};
 }
 
 std::string join_sentences(const std::vector<std::string>& sentences) {
@@ -100,7 +109,7 @@ std::string join_sentences(const std::vector<std::string>& sentences) {
 TranslationSession::TranslationSession(TranslationDirection direction)
     : direction_(direction) {}
 
-TranslationDirection TranslationSession::direction() const {
+const TranslationDirection& TranslationSession::direction() const {
     return direction_;
 }
 
@@ -108,8 +117,7 @@ std::optional<std::size_t> TranslationSession::add_sentence(std::string original
     original = trim(original);
     if (original.empty()) return std::nullopt;
     Sentence sentence;
-    const TextLanguage language = detect_text_language(original);
-    if (language != TextLanguage::Unknown && language != source_language(direction_)) {
+    if (!text_matches_language(original, direction_.source)) {
         sentence.state = SentenceTranslationState::LanguageMismatch;
     }
     sentence.original = std::move(original);
@@ -156,6 +164,16 @@ std::string TranslationSession::original_text() const {
     std::vector<std::string> parts;
     for (const auto& sentence : sentences_) parts.push_back(sentence.original);
     return join_sentences(parts);
+}
+
+std::vector<std::pair<std::string, std::string>> TranslationSession::translated_pairs() const {
+    std::vector<std::pair<std::string, std::string>> pairs;
+    for (const Sentence& sentence : sentences_) {
+        if (sentence.state == SentenceTranslationState::Translated) {
+            pairs.emplace_back(sentence.original, sentence.translation);
+        }
+    }
+    return pairs;
 }
 
 std::string TranslationSession::translated_text() const {

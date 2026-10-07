@@ -38,7 +38,9 @@ void test_language_detection() {
     assert(detect_text_language("123，456。") == TextLanguage::Unknown);
     assert(parse_direction_code("zh-en") == TranslationDirection::ZhToEn);
     assert(parse_direction_code("en-zh") == TranslationDirection::EnToZh);
-    assert(!parse_direction_code("fr-en"));
+    assert(parse_direction_code("bg-de") == (TranslationDirection{"bg", "de"}));
+    assert(!parse_direction_code("xx-en"));
+    assert(!parse_direction_code("en-en"));
 }
 
 void test_bilingual_session() {

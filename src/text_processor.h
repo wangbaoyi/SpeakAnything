@@ -13,6 +13,8 @@ struct HotwordEntry {
     bool enabled = true;
     std::uint64_t hits = 0;
     float boost = 3.0F;
+    // Copied through translation as is (names, products like "Claude Code").
+    bool keep_untranslated = false;
 };
 
 struct CorrectionRule {

@@ -10,6 +10,8 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
 #endif
 
 namespace {
@@ -33,6 +35,15 @@ std::size_t process_working_set_bytes() {
         return 0;
     }
     return static_cast<std::size_t>(memory.WorkingSetSize);
+#elif defined(__APPLE__)
+    // phys_footprint is what Activity Monitor reports as "Memory".
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return static_cast<std::size_t>(info.phys_footprint);
 #else
     return 0;
 #endif
@@ -65,7 +76,7 @@ bool process_memory_over_limit(int limit_mb, std::size_t baseline_working_set_by
 } // namespace
 
 StreamRecognizer::StreamRecognizer(
-    SenseVoiceEngine& engine,
+    SpeechEngine& engine,
     FsmnVadEngine* vad,
     StreamRecognizerConfig config,
     EventHandler handler,

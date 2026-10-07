@@ -104,13 +104,87 @@ bool SystemAudioMute::active() const {
     return impl_ != nullptr && impl_->changed;
 }
 
+#elif defined(__APPLE__)
+
+#include <CoreAudio/CoreAudio.h>
+
+namespace {
+
+AudioObjectPropertyAddress mute_address() {
+    return {kAudioDevicePropertyMute, kAudioDevicePropertyScopeOutput,
+            kAudioObjectPropertyElementMain};
+}
+
+} // namespace
+
+struct SystemAudioMute::Impl {
+    AudioObjectID device = kAudioObjectUnknown;
+    bool changed = false;
+};
+
+SystemAudioMute::SystemAudioMute() : impl_(std::make_unique<Impl>()) {}
+
+SystemAudioMute::~SystemAudioMute() {
+    restore();
+}
+
+bool SystemAudioMute::mute(std::string& error) {
+    restore();
+    AudioObjectPropertyAddress default_output{
+        kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain};
+    AudioObjectID device = kAudioObjectUnknown;
+    UInt32 size = sizeof(device);
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &default_output, 0, nullptr,
+                                   &size, &device) != noErr ||
+        device == kAudioObjectUnknown) {
+        error = "no default output device";
+        return false;
+    }
+    const AudioObjectPropertyAddress address = mute_address();
+    Boolean settable = false;
+    if (!AudioObjectHasProperty(device, &address) ||
+        AudioObjectIsPropertySettable(device, &address, &settable) != noErr || !settable) {
+        error = "the default output device cannot be muted";
+        return false;
+    }
+    UInt32 muted = 0;
+    size = sizeof(muted);
+    if (AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, &muted) != noErr) {
+        error = "failed to read output mute state";
+        return false;
+    }
+    if (muted != 0) return true;
+    muted = 1;
+    if (AudioObjectSetPropertyData(device, &address, 0, nullptr, sizeof(muted), &muted) != noErr) {
+        error = "failed to mute output";
+        return false;
+    }
+    impl_->device = device;
+    impl_->changed = true;
+    return true;
+}
+
+void SystemAudioMute::restore() {
+    if (impl_ == nullptr || !impl_->changed) return;
+    const AudioObjectPropertyAddress address = mute_address();
+    UInt32 muted = 0;
+    AudioObjectSetPropertyData(impl_->device, &address, 0, nullptr, sizeof(muted), &muted);
+    impl_->changed = false;
+    impl_->device = kAudioObjectUnknown;
+}
+
+bool SystemAudioMute::active() const {
+    return impl_ != nullptr && impl_->changed;
+}
+
 #else
 
 struct SystemAudioMute::Impl {};
 SystemAudioMute::SystemAudioMute() : impl_(std::make_unique<Impl>()) {}
 SystemAudioMute::~SystemAudioMute() = default;
 bool SystemAudioMute::mute(std::string& error) {
-    error = "system playback mute is only available on Windows";
+    error = "system playback mute is not supported on this platform";
     return false;
 }
 void SystemAudioMute::restore() {}

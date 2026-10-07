@@ -105,7 +105,7 @@ TranslatorFactory make_opus_mt_factory(std::filesystem::path models_directory, i
             // session samples its working-set baseline.
             std::string warmup_error;
             translator->translate(
-                direction == TranslationDirection::ZhToEn ? "你好。" : "Hello.", warmup_error);
+                direction.source == "zh" ? "你好。" : "Hello.", warmup_error);
             return translator;
         } catch (const std::exception& exception) {
             error = exception.what();

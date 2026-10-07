@@ -13,3 +13,6 @@
 [submodule "third_party/sentencepiece"]
 	path = third_party/sentencepiece
 	url = https://github.com/google/sentencepiece.git
+[submodule "third_party/whisper.cpp"]
+	path = third_party/whisper.cpp
+	url = https://github.com/ggml-org/whisper.cpp

@@ -7,7 +7,21 @@
 #include "system_audio_mute.h"
 #include "text_processor.h"
 #include "translator.h"
-#include "windows_text_injector.h"
+#include "languages.h"
+#include "model_catalog.h"
+#include "model_manager.h"
+#include "models_page.h"
+#include "text_injector.h"
+#include "whisper_engine.h"
+
+#if defined(_WIN32) || defined(__APPLE__)
+#define SENSEVOICE_NATIVE_INPUT 1
+#endif
+#ifdef __APPLE__
+#include "macos/macos_hotkey.h"
+#include "macos/macos_login_item.h"
+#include "macos/macos_overlay.h"
+#endif
 
 #include <QActionGroup>
 #include <QApplication>
@@ -16,15 +30,18 @@
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QClipboard>
+#include <QCoreApplication>
 #include <QColorDialog>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QContextMenuEvent>
+#include <QCursor>
 #include <QDialog>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QFontComboBox>
 #include <QFrame>
 #include <QGuiApplication>
@@ -40,6 +57,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QLinearGradient>
+#include <QLocale>
 #include <QMessageBox>
 #include <QMenu>
 #include <QMouseEvent>
@@ -55,7 +73,9 @@
 #include <QShowEvent>
 #include <QSlider>
 #include <QSpinBox>
+#include <QStandardPaths>
 #include <QStyle>
+#include <QStyleHints>
 #include <QSystemTrayIcon>
 #include <QTableWidget>
 #include <QTabWidget>
@@ -64,6 +84,7 @@
 #include <QTextOption>
 #include <QTimer>
 #include <QToolButton>
+#include <QTranslator>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -115,6 +136,12 @@ using DwmEnableBlurBehindWindowFn = HRESULT (WINAPI *)(HWND, const DwmBlurBehind
 
 namespace {
 
+// Translation context for every user-visible string. Chinese is the source
+// language; resources/i18n/speakanything_en.ts carries the English text.
+struct Ui {
+    Q_DECLARE_TR_FUNCTIONS(SpeakAnything)
+};
+
 constexpr int bubble_minimum_width = 132;
 constexpr int bubble_maximum_size = 520;
 constexpr int bubble_maximum_width = bubble_maximum_size;
@@ -163,8 +190,17 @@ std::string to_utf8_string(const QString& text) {
     return std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()));
 }
 
+// Hold-to-talk only types on release, so a long sentence-end silence costs
+// nothing; a short one splits natural pauses into separately punctuated and
+// separately translated fragments. Windows keeps its tuned 700 ms.
+#ifdef __APPLE__
+constexpr int default_endpoint_ms = 1200;
+#else
+constexpr int default_endpoint_ms = 700;
+#endif
+
 struct VadSettings {
-    int endpoint_ms = 700;
+    int endpoint_ms = default_endpoint_ms;
     int threshold_percent = 55;
     int minimum_db = -60;
     int snr_db = 3;
@@ -190,6 +226,8 @@ struct SpeechSettings {
     int voice_zh = default_speech_voice_zh;
     int voice_en = default_speech_voice_en;
     int speed_percent = 100;
+    // Speak each sentence as soon as it is translated, before the key is released.
+    bool live = false;
 };
 
 // Speaker order inside voices.bin of kokoro-multi-lang-v1_1: three English
@@ -205,10 +243,10 @@ QList<QPair<int, QString>> kokoroChineseVoices() {
     QList<QPair<int, QString>> voices;
     int id = 3;
     for (const int number : female) {
-        voices.append({id++, QStringLiteral("女声 %1").arg(number, 3, 10, QLatin1Char('0'))});
+        voices.append({id++, Ui::tr("女声 %1").arg(number, 3, 10, QLatin1Char('0'))});
     }
     for (const int number : male) {
-        voices.append({id++, QStringLiteral("男声 %1").arg(number, 3, 10, QLatin1Char('0'))});
+        voices.append({id++, Ui::tr("男声 %1").arg(number, 3, 10, QLatin1Char('0'))});
     }
     return voices;
 }
@@ -347,7 +385,11 @@ ResultContent resultContentFromName(const QString& name) {
     return ResultContent::Original;
 }
 
+#ifdef __APPLE__
+constexpr auto default_hotkey = "Meta+Alt+Space";
+#else
 constexpr auto default_hotkey = "Ctrl+Alt+Space";
+#endif
 constexpr auto control_windows_hotkey = "Ctrl+Win";
 
 #ifdef _WIN32
@@ -397,6 +439,26 @@ bool setWindowsStartupEnabled(bool enabled) {
 }
 #endif
 
+bool platformStartupEnabled() {
+#if defined(_WIN32)
+    return windowsStartupEnabled();
+#elif defined(__APPLE__)
+    return macos_login_item_enabled();
+#else
+    return false;
+#endif
+}
+
+bool setPlatformStartupEnabled(bool enabled) {
+#if defined(_WIN32)
+    return setWindowsStartupEnabled(enabled);
+#elif defined(__APPLE__)
+    return macos_set_login_item_enabled(enabled);
+#else
+    return !enabled;
+#endif
+}
+
 QString canonicalShortcut(const QString& value) {
     QString compact = value;
     compact.remove(QLatin1Char(' '));
@@ -412,7 +474,11 @@ QString canonicalShortcut(const QString& value) {
 }
 
 bool hasUsableShortcutKey(const QString& shortcut) {
+#ifdef _WIN32
     if (shortcut == QString::fromLatin1(control_windows_hotkey)) return true;
+#else
+    if (shortcut == QString::fromLatin1(control_windows_hotkey)) return false;
+#endif
 
     const QKeySequence sequence = QKeySequence::fromString(shortcut, QKeySequence::PortableText);
     if (sequence.isEmpty() || sequence.count() != 1) return false;
@@ -428,6 +494,84 @@ QString shortcutDisplayName(const QString& shortcut) {
     const QKeySequence sequence = QKeySequence::fromString(shortcut, QKeySequence::PortableText);
     const QString native_text = sequence.toString(QKeySequence::NativeText);
     return native_text.isEmpty() ? shortcut : native_text;
+}
+
+// Models, dictionaries and hotwords. Inside a macOS bundle they ship in
+// Contents/Resources; everywhere else they sit next to the executable.
+QString dataDirectory() {
+    const QString app_directory = QCoreApplication::applicationDirPath();
+#ifdef __APPLE__
+    const QString resources = QDir(app_directory).absoluteFilePath(QStringLiteral("../Resources"));
+    if (QFileInfo::exists(QDir(resources).filePath(QStringLiteral("models")))) {
+        return QDir::cleanPath(resources);
+    }
+#endif
+    return app_directory;
+}
+
+// "auto", "zh" or "en"; stored with the other settings.
+QString uiLanguageSetting() {
+    const QString forced = qEnvironmentVariable("SPEAKANYTHING_LANG");
+    if (forced == QStringLiteral("zh") || forced == QStringLiteral("en")) return forced;
+    const QString value = QSettings(QStringLiteral("SenseVoice"), QStringLiteral("LocalDictation"))
+        .value(QStringLiteral("ui/language"), QStringLiteral("auto")).toString();
+    return value == QStringLiteral("zh") || value == QStringLiteral("en") ? value : QStringLiteral("auto");
+}
+
+// Chinese strings are the source text, so Chinese needs no translator.
+void installUiTranslator(QApplication& application) {
+    const QString setting = uiLanguageSetting();
+    const bool english = setting == QStringLiteral("en") ||
+        (setting == QStringLiteral("auto") && QLocale::system().language() != QLocale::Chinese);
+    if (!english) return;
+    auto* translator = new QTranslator(&application);
+    if (translator->load(QStringLiteral(":/i18n/speakanything_en.qm"))) {
+        application.installTranslator(translator);
+    } else {
+        delete translator;
+    }
+}
+
+// Speech models to try, fastest first: the Core ML build on the Neural Engine
+// (macOS 15+), then the GGUF model, which the engine runs on the GPU through
+// Metal when it can and on the CPU otherwise. SPEAKANYTHING_ASR=gguf skips
+// the Neural Engine.
+std::vector<std::filesystem::path> speechModelCandidates(const std::filesystem::path& models) {
+    std::vector<std::filesystem::path> candidates;
+#ifdef SENSEVOICE_WITH_COREML
+    const std::filesystem::path coreml = models / "sensevoice-coreml";
+    if (std::filesystem::is_directory(coreml) &&
+        qEnvironmentVariable("SPEAKANYTHING_ASR") != QStringLiteral("gguf")) {
+        candidates.push_back(coreml);
+    }
+#endif
+    candidates.push_back(models / "sensevoice-small-q8.gguf");
+    return candidates;
+}
+
+// Hotwords are user data. On macOS they live in Application Support, since the
+// app bundle must stay unmodified; a bundled file only seeds the first read.
+std::filesystem::path hotwordsPath(bool for_writing) {
+    const std::filesystem::path bundled =
+        std::filesystem::path(dataDirectory().toStdWString()) / "hotwords.tsv";
+#ifdef __APPLE__
+    const QString directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(directory);
+    const std::filesystem::path user =
+        std::filesystem::path(directory.toStdWString()) / "hotwords.tsv";
+    if (for_writing || std::filesystem::exists(user)) return user;
+#else
+    (void)for_writing;
+#endif
+    return bundled;
+}
+
+QString pasteShortcutText() {
+#ifdef __APPLE__
+    return QStringLiteral("⌘V");
+#else
+    return QStringLiteral("Ctrl+V");
+#endif
 }
 
 QIcon sensevoiceIcon() {
@@ -787,23 +931,23 @@ class VadStatusDot final : public QWidget {
 public:
     explicit VadStatusDot(QWidget* parent = nullptr) : QWidget(parent) {
         setFixedSize(8, 8);
-        setToolTip(QStringLiteral("VAD 静音"));
+        setToolTip(Ui::tr("VAD 静音"));
     }
 
     void setActivity(VadActivity activity) {
         activity_ = activity;
         switch (activity_) {
         case VadActivity::Speech:
-            setToolTip(QStringLiteral("VAD 已触发：语音"));
+            setToolTip(Ui::tr("VAD 已触发：语音"));
             break;
         case VadActivity::EndpointWait:
-            setToolTip(QStringLiteral("VAD 已触发：等待句尾"));
+            setToolTip(Ui::tr("VAD 已触发：等待句尾"));
             break;
         case VadActivity::Candidate:
-            setToolTip(QStringLiteral("VAD 候选"));
+            setToolTip(Ui::tr("VAD 候选"));
             break;
         case VadActivity::Silence:
-            setToolTip(QStringLiteral("VAD 静音"));
+            setToolTip(Ui::tr("VAD 静音"));
             break;
         }
         update();
@@ -849,7 +993,7 @@ public:
 
         cancel_button_ = new QToolButton;
         cancel_button_->setIcon(QWidget::style()->standardIcon(QStyle::SP_DialogCancelButton));
-        cancel_button_->setToolTip(QStringLiteral("取消"));
+        cancel_button_->setToolTip(Ui::tr("取消"));
         vad_dot_ = new VadStatusDot;
         waveform_ = new LevelWaveform;
         elapsed_label_ = new QLabel(QStringLiteral("00:00"));
@@ -857,17 +1001,17 @@ public:
         elapsed_label_->setAlignment(Qt::AlignCenter);
         elapsed_label_->setStyleSheet(QStringLiteral(
             "color: #D6D8DC; font-family: Consolas; font-size: 11px;"));
-        mode_label_ = new QLabel(QStringLiteral("精简"));
+        mode_label_ = new QLabel(Ui::tr("精简"));
         mode_label_->setObjectName(QStringLiteral("mode"));
-        mode_label_->setFixedWidth(38);
+        mode_label_->setMinimumWidth(38);
         mode_label_->setAlignment(Qt::AlignCenter);
         mode_label_->setStyleSheet(QStringLiteral("color: #969BA4; font-size: 10px;"));
         primary_button_ = new QToolButton;
         primary_button_->setObjectName(QStringLiteral("primary"));
-        primary_button_->setToolTip(QStringLiteral("开始"));
+        primary_button_->setToolTip(Ui::tr("开始"));
         translate_button_ = new QToolButton;
         translate_button_->setObjectName(QStringLiteral("translate"));
-        translate_button_->setText(QStringLiteral("译"));
+        translate_button_->setText(Ui::tr("译"));
         translate_button_->setCheckable(true);
         direction_button_ = new QToolButton;
         direction_button_->setObjectName(QStringLiteral("direction"));
@@ -875,7 +1019,7 @@ public:
         close_button_ = new QToolButton;
         close_button_->setObjectName(QStringLiteral("close"));
         close_button_->setText(QStringLiteral("×"));
-        close_button_->setToolTip(QStringLiteral("关闭浮窗"));
+        close_button_->setToolTip(Ui::tr("关闭浮窗"));
         close_button_->setVisible(false);
 
         layout_->addWidget(vad_dot_);
@@ -978,11 +1122,11 @@ public:
         direction_button_->style()->unpolish(direction_button_);
         direction_button_->style()->polish(direction_button_);
         translate_button_->setToolTip(enabled
-            ? QStringLiteral("翻译模式：开（点击关闭）")
-            : QStringLiteral("翻译模式：关（点击开启）"));
+            ? Ui::tr("翻译模式：开（点击关闭）")
+            : Ui::tr("翻译模式：关（点击开启）"));
         direction_button_->setToolTip(translation_loading_
-            ? QStringLiteral("正在加载翻译模型...")
-            : QStringLiteral("翻译方向（点击切换）"));
+            ? Ui::tr("正在加载翻译模型...")
+            : Ui::tr("翻译方向（点击切换）"));
         if (translation_loading_) {
             if (!spinner_timer_.isActive()) spinner_timer_.start();
         } else {
@@ -999,9 +1143,9 @@ public:
         primary_button_->setEnabled(true);
         primary_button_->setIcon(QWidget::style()->standardIcon(
             listening ? QStyle::SP_DialogApplyButton : QStyle::SP_MediaPlay));
-        primary_button_->setToolTip(listening ? QStringLiteral("完成") : QStringLiteral("开始"));
+        primary_button_->setToolTip(listening ? Ui::tr("完成") : Ui::tr("开始"));
         close_button_->setEnabled(!listening);
-        elapsed_label_->setText(listening ? QStringLiteral("00:00") : QStringLiteral("就绪"));
+        elapsed_label_->setText(listening ? QStringLiteral("00:00") : Ui::tr("就绪"));
     }
 
     void setStopping(bool stopping) {
@@ -1009,7 +1153,7 @@ public:
         cancel_button_->setEnabled(!stopping && listening_);
         primary_button_->setEnabled(!stopping);
         close_button_->setEnabled(!stopping && !listening_);
-        if (stopping) elapsed_label_->setText(QStringLiteral("处理中"));
+        if (stopping) elapsed_label_->setText(Ui::tr("处理中"));
     }
 
     void setTelemetry(float input_db, VadActivity activity) {
@@ -1033,7 +1177,7 @@ public:
     }
 
     void setMode(TextMode mode) {
-        mode_label_->setText(mode == TextMode::Raw ? QStringLiteral("原文") : QStringLiteral("精简"));
+        mode_label_->setText(mode == TextMode::Raw ? Ui::tr("原文") : Ui::tr("精简"));
     }
 
 protected:
@@ -1159,9 +1303,10 @@ private:
     void updateDirectionText() {
         static const std::array<QString, 4> spinner = {
             QStringLiteral("◐"), QStringLiteral("◓"), QStringLiteral("◑"), QStringLiteral("◒")};
-        QString text = translation_direction_ == TranslationDirection::ZhToEn
-            ? QStringLiteral("中→英")
-            : QStringLiteral("英→中");
+        QString text = translation_direction_ == TranslationDirection::ZhToEn ? Ui::tr("中→英")
+            : translation_direction_ == TranslationDirection::EnToZh       ? Ui::tr("英→中")
+            : QString::fromStdString(translation_direction_.source).toUpper() + QStringLiteral("→") +
+                QString::fromStdString(translation_direction_.target).toUpper();
         if (translation_loading_) {
             text = spinner[static_cast<std::size_t>(spinner_frame_)] + QLatin1Char(' ') + text;
         }
@@ -1435,13 +1580,26 @@ public:
                         const AppearanceSettings& appearance,
                         BubbleStyle bubble_style,
                         std::function<void(const AppearanceSettings&)> on_appearance_changed,
+                        ModelManager* model_manager = nullptr,
+                        ModelChoices model_choices = {},
                         QWidget* parent = nullptr)
         : QDialog(parent), appearance_(appearance), bubble_style_(bubble_style),
+          model_manager_(model_manager), initial_model_choices_(std::move(model_choices)),
           on_appearance_changed_(std::move(on_appearance_changed)) {
-        setWindowTitle(QStringLiteral("语音输入设置"));
+        setWindowTitle(Ui::tr("语音输入设置"));
         setWindowFlag(Qt::WindowContextHelpButtonHint, false);
-        resize(680, 720);
+        resize(760, 720);
         setMinimumSize(600, 520);
+#ifdef __APPLE__
+        // Native macOS controls, fonts and dark mode; only the cards get a
+        // style, built from palette roles so it follows light and dark.
+        setStyleSheet(QStringLiteral(
+            "QScrollArea, QScrollArea > QWidget > QWidget#page { background: transparent; border: none; }"
+            "QFrame#card { background: rgba(128, 128, 128, 0.10); border: 1px solid rgba(128, 128, 128, 0.22); border-radius: 10px; }"
+            "QFrame#card QLabel { background: transparent; }"
+            "QLabel#cardTitle { font-weight: 600; }"
+            "QLabel#cardHint { color: palette(placeholder-text); }"));
+#else
         setStyleSheet(QStringLiteral(
             "QDialog { background: #F7F8FA; }"
             "QLabel { color: #202329; }"
@@ -1452,7 +1610,7 @@ public:
             "QLabel#cardTitle { color: #202329; font-weight: 600; }"
             "QLabel#cardHint { color: #7A808A; }"
             "QLabel#rowLabel { color: #4A505A; }"
-            "QTabBar::tab { color: #676D77; padding: 8px 20px; background: #EEF0F3; border: 1px solid #DADDE2; border-bottom: none; }"
+            "QTabBar::tab { color: #676D77; padding: 8px 14px; background: #EEF0F3; border: 1px solid #DADDE2; border-bottom: none; }"
             "QTabBar::tab:selected { color: #202329; background: #F2F4F7; font-weight: 600; }"
             "QComboBox, QKeySequenceEdit, QDoubleSpinBox { min-height: 32px; padding: 0 9px; border: 1px solid #D7DAE0; border-radius: 5px; background: #FFFFFF; color: #30343A; }"
             "QComboBox:focus, QKeySequenceEdit:focus, QDoubleSpinBox:focus { border: 1px solid #356AE6; }"
@@ -1471,12 +1629,13 @@ public:
             "QTableWidget { border: 1px solid #DADDE2; border-radius: 5px; background: #FFFFFF; gridline-color: #ECEEF1; color: #30343A; }"
             "QTableWidget::item:selected { background: #EAF0FF; color: #202329; }"
             "QHeaderView::section { padding: 7px; border: none; border-bottom: 1px solid #DADDE2; background: #F5F6F8; color: #676D77; }"));
+#endif
 
         auto* root = new QVBoxLayout(this);
         root->setContentsMargins(24, 20, 24, 20);
         root->setSpacing(16);
 
-        auto* heading = new QLabel(QStringLiteral("语音输入设置"));
+        auto* heading = new QLabel(Ui::tr("语音输入设置"));
         QFont heading_font = heading->font();
         heading_font.setPointSize(13);
         heading_font.setWeight(QFont::DemiBold);
@@ -1485,12 +1644,17 @@ public:
 
         auto* tabs = new QTabWidget;
         tabs->setDocumentMode(false);
-        tabs->addTab(scrollable(createInputPage(shortcut, trigger, startup_enabled)), QStringLiteral("输入"));
-        tabs->addTab(scrollable(createOutputPage(mode, destination, input_content, clipboard_content, paste_delay_ms)), QStringLiteral("输出"));
-        tabs->addTab(scrollable(carded(createAppearancePage())), QStringLiteral("外观"));
-        tabs->addTab(scrollable(carded(createTranslationPage(translation))), QStringLiteral("翻译"));
-        tabs->addTab(scrollable(createSpeechPage(speech)), QStringLiteral("朗读"));
-        tabs->addTab(createHotwordPage(hotwords), QStringLiteral("热词"));
+        tabs->addTab(scrollable(createInputPage(shortcut, trigger, startup_enabled)), Ui::tr("输入"));
+        tabs->addTab(scrollable(createOutputPage(mode, destination, input_content, clipboard_content, paste_delay_ms)), Ui::tr("输出"));
+        tabs->addTab(scrollable(carded(createAppearancePage())), Ui::tr("外观"));
+        tabs->addTab(scrollable(carded(createTranslationPage(translation))), Ui::tr("翻译"));
+        tabs->addTab(scrollable(createSpeechPage(speech)), Ui::tr("朗读"));
+        tabs->addTab(createHotwordPage(hotwords), Ui::tr("热词"));
+        if (model_manager_ != nullptr) {
+            models_page_ = new ModelsPage(model_manager_, initial_model_choices_);
+            models_page_->setLanguages(languageCode(translation_source_), languageCode(translation_target_));
+            tabs->addTab(scrollable(models_page_), Ui::tr("模型"));
+        }
         tabs->addTab(scrollable(carded(createVadPage(values))), QStringLiteral("VAD"));
         root->addWidget(tabs);
         for (QComboBox* combo : {content_, clipboard_content_}) {
@@ -1504,10 +1668,12 @@ public:
 
         auto* buttons = new QHBoxLayout;
         buttons->setSpacing(8);
-        auto* reset_button = new QPushButton(QStringLiteral("恢复默认"));
-        auto* cancel_button = new QPushButton(QStringLiteral("取消"));
-        auto* apply_button = new QPushButton(QStringLiteral("应用"));
+        auto* reset_button = new QPushButton(Ui::tr("恢复默认"));
+        auto* cancel_button = new QPushButton(Ui::tr("取消"));
+        auto* apply_button = new QPushButton(Ui::tr("应用"));
         apply_button->setObjectName(QStringLiteral("primary"));
+        // The native accent-coloured default button on macOS.
+        apply_button->setDefault(true);
         buttons->addWidget(reset_button);
         buttons->addStretch();
         buttons->addWidget(cancel_button);
@@ -1515,7 +1681,7 @@ public:
         root->addLayout(buttons);
 
         connect(reset_button, &QPushButton::clicked, this, [this] {
-            endpoint_slider_->setValue(700);
+            endpoint_slider_->setValue(default_endpoint_ms);
             threshold_slider_->setValue(55);
             minimum_db_slider_->setValue(-60);
             snr_slider_->setValue(3);
@@ -1529,7 +1695,8 @@ public:
             trigger_->setCurrentIndex(trigger_->findData(static_cast<int>(HotkeyTrigger::Hold)));
             paste_delay_slider_->setValue(default_paste_delay_ms);
             translation_enabled_checkbox_->setChecked(false);
-            translation_direction_->setCurrentIndex(0);
+            translation_source_->setCurrentIndex(translation_source_->findData(QStringLiteral("zh")));
+            translation_target_->setCurrentIndex(translation_target_->findData(QStringLiteral("en")));
             translation_separator_->setText(QString::fromLatin1(default_translation_separator));
             speech_enabled_checkbox_->setChecked(false);
             speech_monitor_checkbox_->setChecked(false);
@@ -1540,7 +1707,7 @@ public:
         connect(cancel_button, &QPushButton::clicked, this, &QDialog::reject);
         connect(apply_button, &QPushButton::clicked, this, [this] {
             if (!hasUsableShortcutKey(this->shortcut())) {
-                shortcut_error_->setText(QStringLiteral("请录入一个包含普通按键的组合，例如 Ctrl + Alt + Space。"));
+                shortcut_error_->setText(Ui::tr("请录入一个包含普通按键的组合，例如 Ctrl + Alt + Space。"));
                 shortcut_error_->setVisible(true);
                 return;
             }
@@ -1594,9 +1761,9 @@ public:
     TranslationSettings translation() const {
         return TranslationSettings{
             .enabled = translation_enabled_checkbox_->isChecked(),
-            .direction = translation_direction_->currentIndex() == 0
-                ? TranslationDirection::ZhToEn
-                : TranslationDirection::EnToZh,
+            .direction = TranslationDirection{
+                languageCode(translation_source_).toStdString(),
+                languageCode(translation_target_).toStdString()},
             .separator = sanitizedSeparator(translation_separator_->text()),
         };
     }
@@ -1609,6 +1776,7 @@ public:
             .voice_zh = speech_voice_zh_->currentData().toInt(),
             .voice_en = speech_voice_en_->currentData().toInt(),
             .speed_percent = speech_speed_slider_->value(),
+            .live = speech_live_checkbox_->isChecked(),
         };
     }
 
@@ -1636,6 +1804,9 @@ public:
             }
             const QTableWidgetItem* hits_item = hotword_table_->item(row, 4);
             if (hits_item != nullptr) entry.hits = hits_item->text().toULongLong();
+            if (const auto* keep = qobject_cast<QCheckBox*>(hotword_table_->cellWidget(row, 5))) {
+                entry.keep_untranslated = keep->isChecked();
+            }
             entries.push_back(std::move(entry));
         }
         return entries;
@@ -1668,13 +1839,13 @@ private:
             layout->addWidget(label);
         };
 
-        add_heading(QStringLiteral("配色主题与字体"));
+        add_heading(Ui::tr("配色主题与字体"));
         theme_preset_ = new QComboBox;
-        theme_preset_->addItem(QStringLiteral("默认（各浮窗样式原有配色）"), static_cast<int>(ThemePreset::Default));
-        theme_preset_->addItem(QStringLiteral("亮色"), static_cast<int>(ThemePreset::Light));
-        theme_preset_->addItem(QStringLiteral("暗色"), static_cast<int>(ThemePreset::Dark));
-        theme_preset_->addItem(QStringLiteral("高对比度"), static_cast<int>(ThemePreset::HighContrast));
-        theme_preset_->addItem(QStringLiteral("自定义"), static_cast<int>(ThemePreset::Custom));
+        theme_preset_->addItem(Ui::tr("默认（各浮窗样式原有配色）"), static_cast<int>(ThemePreset::Default));
+        theme_preset_->addItem(Ui::tr("亮色"), static_cast<int>(ThemePreset::Light));
+        theme_preset_->addItem(Ui::tr("暗色"), static_cast<int>(ThemePreset::Dark));
+        theme_preset_->addItem(Ui::tr("高对比度"), static_cast<int>(ThemePreset::HighContrast));
+        theme_preset_->addItem(Ui::tr("自定义"), static_cast<int>(ThemePreset::Custom));
         layout->addWidget(theme_preset_);
 
         auto* colors_row = new QHBoxLayout;
@@ -1695,9 +1866,9 @@ private:
             });
             return button;
         };
-        background_button_ = add_color_button(QStringLiteral("背景"), &ThemeColors::background);
-        text_button_ = add_color_button(QStringLiteral("文字"), &ThemeColors::text);
-        accent_button_ = add_color_button(QStringLiteral("强调色"), &ThemeColors::accent);
+        background_button_ = add_color_button(Ui::tr("背景"), &ThemeColors::background);
+        text_button_ = add_color_button(Ui::tr("文字"), &ThemeColors::text);
+        accent_button_ = add_color_button(Ui::tr("强调色"), &ThemeColors::accent);
         colors_row->addStretch();
         layout->addLayout(colors_row);
 
@@ -1708,24 +1879,24 @@ private:
         font_size_->setRange(8, 24);
         font_size_->setSuffix(QStringLiteral(" pt"));
         font_size_->setMinimumHeight(32);
-        font_row->addWidget(new QLabel(QStringLiteral("字体")));
+        font_row->addWidget(new QLabel(Ui::tr("字体")));
         font_row->addWidget(font_family_, 1);
         font_row->addWidget(font_size_);
         layout->addLayout(font_row);
 
         layout->addSpacing(6);
-        add_heading(QStringLiteral("浮窗显示"));
-        linger_slider_ = addSlider(layout, QStringLiteral("识别完成后的停留时长"), 0,
+        add_heading(Ui::tr("浮窗显示"));
+        linger_slider_ = addSlider(layout, Ui::tr("识别完成后的停留时长"), 0,
                                    linger_maximum_ms / linger_step_ms, 1,
                                    appearance_.linger_ms / linger_step_ms, ValueFormat::HalfSeconds);
-        pinned_checkbox_ = new QCheckBox(QStringLiteral("常驻显示（按快捷键唤出后不自动隐藏，点浮窗上的 × 关闭）"));
+        pinned_checkbox_ = new QCheckBox(Ui::tr("常驻显示（按快捷键唤出后不自动隐藏，点浮窗上的 × 关闭）"));
         pinned_checkbox_->setChecked(appearance_.pinned);
         layout->addWidget(pinned_checkbox_);
         layout->addStretch();
 
-        auto* note = new QLabel(QStringLiteral("外观修改即时生效，不需要点“应用”，点“取消”也不会撤回。"));
+        auto* note = new QLabel(Ui::tr("外观修改即时生效，不需要点“应用”，点“取消”也不会撤回。"));
         note->setWordWrap(true);
-        note->setStyleSheet(QStringLiteral("color: #69707A;"));
+        note->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
         layout->addWidget(note);
 
         refreshAppearanceControls();
@@ -1832,7 +2003,10 @@ private:
         row->setSpacing(12);
         auto* label = new QLabel(label_text);
         label->setObjectName(QStringLiteral("rowLabel"));
-        label->setFixedWidth(76);
+        // One width per language keeps the fields in a card aligned; English
+        // labels run longer than the Chinese ones 76 px was sized for.
+        static const int label_width = Ui::tr("组合键") == QStringLiteral("组合键") ? 76 : 124;
+        label->setFixedWidth(label_width);
         row->addWidget(label);
         row->addWidget(field, 1);
         card->addLayout(row);
@@ -1861,26 +2035,29 @@ private:
         auto* page = new QWidget;
         auto* layout = pageLayout(page);
 
-        QVBoxLayout* hotkey_card = addCard(layout, QStringLiteral("快捷键"));
+        QVBoxLayout* hotkey_card = addCard(layout, Ui::tr("快捷键"));
         shortcut_preset_ = new QComboBox;
-        shortcut_preset_->addItem(QStringLiteral("Ctrl + Alt + Space（推荐）"),
+        shortcut_preset_->addItem(Ui::tr("%1（推荐）")
+                                      .arg(shortcutDisplayName(QString::fromLatin1(default_hotkey))),
                                   QString::fromLatin1(default_hotkey));
+#ifdef _WIN32
         shortcut_preset_->addItem(QStringLiteral("Ctrl + Win"),
                                   QString::fromLatin1(control_windows_hotkey));
-        shortcut_preset_->addItem(QStringLiteral("Ctrl + Shift + Space"),
+#endif
+        shortcut_preset_->addItem(shortcutDisplayName(QStringLiteral("Ctrl+Shift+Space")),
                                   QStringLiteral("Ctrl+Shift+Space"));
         shortcut_preset_->addItem(QStringLiteral("F8"), QStringLiteral("F8"));
-        shortcut_preset_->addItem(QStringLiteral("自定义"), QStringLiteral("custom"));
-        addRow(hotkey_card, QStringLiteral("组合键"), shortcut_preset_);
+        shortcut_preset_->addItem(Ui::tr("自定义"), QStringLiteral("custom"));
+        addRow(hotkey_card, Ui::tr("组合键"), shortcut_preset_);
 
         shortcut_edit_ = new QKeySequenceEdit;
         shortcut_edit_->setMaximumSequenceLength(1);
-        shortcut_edit_->setToolTip(QStringLiteral("点击后按下一个组合键"));
+        shortcut_edit_->setToolTip(Ui::tr("点击后按下一个组合键"));
         shortcut_edit_row_ = new QWidget;
         auto* edit_row = new QVBoxLayout(shortcut_edit_row_);
         edit_row->setContentsMargins(0, 0, 0, 0);
         auto* edit_wrapper = new QVBoxLayout;
-        addRow(edit_wrapper, QStringLiteral("录入"), shortcut_edit_);
+        addRow(edit_wrapper, Ui::tr("录入"), shortcut_edit_);
         edit_row->addLayout(edit_wrapper);
         hotkey_card->addWidget(shortcut_edit_row_);
 
@@ -1890,19 +2067,24 @@ private:
         shortcut_error_->setVisible(false);
         hotkey_card->addWidget(shortcut_error_);
 
-        QVBoxLayout* trigger_card = addCard(layout, QStringLiteral("触发方式"),
-            QStringLiteral("切换方式下，文字输入到第二次按快捷键时光标所在的位置，最长录音 5 分钟。"));
+        QVBoxLayout* trigger_card = addCard(layout, Ui::tr("触发方式"),
+            Ui::tr("切换方式下，文字输入到第二次按快捷键时光标所在的位置，最长录音 5 分钟。"));
         trigger_ = new QComboBox;
-        trigger_->addItem(QStringLiteral("按住说话：按住开始，松开结束"), static_cast<int>(HotkeyTrigger::Hold));
-        trigger_->addItem(QStringLiteral("按一下切换：按一下开始，再按一下结束"), static_cast<int>(HotkeyTrigger::Toggle));
+        trigger_->addItem(Ui::tr("按住说话：按住开始，松开结束"), static_cast<int>(HotkeyTrigger::Hold));
+        trigger_->addItem(Ui::tr("按一下切换：按一下开始，再按一下结束"), static_cast<int>(HotkeyTrigger::Toggle));
         trigger_->setCurrentIndex(trigger_->findData(static_cast<int>(trigger)));
         trigger_card->addWidget(trigger_);
 
-        QVBoxLayout* startup_card = addCard(layout, QStringLiteral("启动"));
-        startup_checkbox_ = new QCheckBox(QStringLiteral("开机自动启动"));
+        QVBoxLayout* startup_card = addCard(layout, Ui::tr("启动"));
+        startup_checkbox_ = new QCheckBox(Ui::tr("开机自动启动"));
         startup_checkbox_->setChecked(startup_enabled);
-        startup_checkbox_->setToolTip(QStringLiteral(
+#ifdef __APPLE__
+        startup_checkbox_->setToolTip(Ui::tr(
+            "登录时自动打开，可在“系统设置 › 通用 › 登录项”中管理。"));
+#else
+        startup_checkbox_->setToolTip(Ui::tr(
             "使用当前用户的 Windows 启动项注册，不需要管理员权限。"));
+#endif
         startup_card->addWidget(startup_checkbox_);
         layout->addStretch();
 
@@ -1938,13 +2120,13 @@ private:
         auto* page = new QWidget;
         auto* layout = pageLayout(page);
 
-        QVBoxLayout* text_card = addCard(layout, QStringLiteral("文字整理"),
-            QStringLiteral("精简会去掉口头语和重复，原文保留识别出的每个字。"));
+        QVBoxLayout* text_card = addCard(layout, Ui::tr("文字整理"),
+            Ui::tr("精简会去掉口头语和重复，原文保留识别出的每个字。"));
         auto* mode_row = new QHBoxLayout;
         mode_row->setSpacing(6);
         mode_group_ = new QButtonGroup(this);
-        raw_mode_button_ = new QPushButton(QStringLiteral("原文"));
-        clean_mode_button_ = new QPushButton(QStringLiteral("精简"));
+        raw_mode_button_ = new QPushButton(Ui::tr("原文"));
+        clean_mode_button_ = new QPushButton(Ui::tr("精简"));
         for (QPushButton* button : {raw_mode_button_, clean_mode_button_}) {
             button->setObjectName(QStringLiteral("modeSegment"));
             button->setCheckable(true);
@@ -1956,39 +2138,39 @@ private:
         mode_row->addStretch();
         text_card->addLayout(mode_row);
 
-        QVBoxLayout* result_card = addCard(layout, QStringLiteral("识别结果"));
+        QVBoxLayout* result_card = addCard(layout, Ui::tr("识别结果"));
         destination_ = new QComboBox;
-        destination_->addItem(QStringLiteral("输入到光标位置（同时复制到剪贴板）"),
+        destination_->addItem(Ui::tr("输入到光标位置（同时复制到剪贴板）"),
                               static_cast<int>(ResultDestination::Insert));
-        destination_->addItem(QStringLiteral("只复制到剪贴板"),
+        destination_->addItem(Ui::tr("只复制到剪贴板"),
                               static_cast<int>(ResultDestination::CopyOnly));
         destination_->setCurrentIndex(destination_->findData(static_cast<int>(destination)));
-        destination_->setToolTip(QStringLiteral("只复制时不会自动输入，需要自己按 Ctrl+V 粘贴。"));
-        addRow(result_card, QStringLiteral("去向"), destination_);
+        destination_->setToolTip(Ui::tr("只复制时不会自动输入，需要自己按 %1 粘贴。").arg(pasteShortcutText()));
+        addRow(result_card, Ui::tr("去向"), destination_);
         const auto content_combo = [](ResultContent current) {
             auto* combo = new QComboBox;
-            combo->addItem(QStringLiteral("原文"), static_cast<int>(ResultContent::Original));
-            combo->addItem(QStringLiteral("译文"), static_cast<int>(ResultContent::Translation));
-            combo->addItem(QStringLiteral("原文 + 译文"), static_cast<int>(ResultContent::Both));
+            combo->addItem(Ui::tr("原文"), static_cast<int>(ResultContent::Original));
+            combo->addItem(Ui::tr("译文"), static_cast<int>(ResultContent::Translation));
+            combo->addItem(Ui::tr("原文 + 译文"), static_cast<int>(ResultContent::Both));
             combo->setCurrentIndex(combo->findData(static_cast<int>(current)));
             return combo;
         };
         content_ = content_combo(input_content);
-        content_->setToolTip(QStringLiteral("识别完成后浮窗上显示的文字，只给自己看。"));
-        addRow(result_card, QStringLiteral("浮窗内容"), content_);
+        content_->setToolTip(Ui::tr("识别完成后浮窗上显示的文字，只给自己看。"));
+        addRow(result_card, Ui::tr("浮窗内容"), content_);
         clipboard_content_ = content_combo(clipboard_content);
-        clipboard_content_->setToolTip(QStringLiteral("放进剪贴板的文字；输入到光标位置的也是这一段。"));
-        addRow(result_card, QStringLiteral("剪贴板内容"), clipboard_content_);
-        content_hint_ = new QLabel(QStringLiteral("需要在「翻译」页开启翻译模式，否则会输出原文。"));
+        clipboard_content_->setToolTip(Ui::tr("放进剪贴板的文字；输入到光标位置的也是这一段。"));
+        addRow(result_card, Ui::tr("剪贴板内容"), clipboard_content_);
+        content_hint_ = new QLabel(Ui::tr("需要在「翻译」页开启翻译模式，否则会输出原文。"));
         content_hint_->setWordWrap(true);
         content_hint_->setStyleSheet(QStringLiteral("color: #C77A14;"));
         result_card->addWidget(content_hint_);
 
-        QVBoxLayout* paste_card = addCard(layout, QStringLiteral("粘贴兜底"),
-            QStringLiteral("目标程序不支持直接输入时，等待这段时间后按 Ctrl+V 粘贴。只在「输入到光标位置」时生效。"));
+        QVBoxLayout* paste_card = addCard(layout, Ui::tr("粘贴兜底"),
+            Ui::tr("目标程序不支持直接输入时，等待这段时间后按 %1 粘贴。只在「输入到光标位置」时生效。").arg(pasteShortcutText()));
         auto* paste_layout = new QVBoxLayout;
         paste_card->addLayout(paste_layout);
-        paste_delay_slider_ = addSlider(paste_layout, QStringLiteral("粘贴延迟"),
+        paste_delay_slider_ = addSlider(paste_layout, Ui::tr("粘贴延迟"),
                                         0, maximum_paste_delay_ms, 50, paste_delay_ms,
                                         ValueFormat::Milliseconds);
         const auto update_paste_delay = [this] {
@@ -2017,51 +2199,73 @@ private:
             layout->addWidget(label);
         };
 
-        translation_enabled_checkbox_ = new QCheckBox(QStringLiteral("开启翻译模式"));
+        translation_enabled_checkbox_ = new QCheckBox(Ui::tr("开启翻译模式"));
         translation_enabled_checkbox_->setChecked(translation.enabled);
-        translation_enabled_checkbox_->setToolTip(QStringLiteral(
+        translation_enabled_checkbox_->setToolTip(Ui::tr(
             "开启后，原文和译文会一起写入光标位置。"));
         layout->addWidget(translation_enabled_checkbox_);
 
-        add_heading(QStringLiteral("翻译方向"));
-        translation_direction_ = new QComboBox;
-        translation_direction_->addItem(QStringLiteral("中文 → 英文"));
-        translation_direction_->addItem(QStringLiteral("英文 → 中文"));
-        translation_direction_->setCurrentIndex(
-            translation.direction == TranslationDirection::ZhToEn ? 0 : 1);
-        layout->addWidget(translation_direction_);
+        // Every language Qwen and Whisper handle; SenseVoice covers the first five.
+        const auto make_language_combo = [](const std::string& selected) {
+            auto* combo = new QComboBox;
+            for (const LanguageInfo& language : supported_languages()) {
+                const QString native = QString::fromUtf8(language.native_name.data(),
+                                                          static_cast<qsizetype>(language.native_name.size()));
+                const QString english = QString::fromUtf8(language.english_name.data(),
+                                                           static_cast<qsizetype>(language.english_name.size()));
+                combo->addItem(native == english ? native : native + QStringLiteral(" · ") + english,
+                               QString::fromUtf8(language.code.data(), static_cast<qsizetype>(language.code.size())));
+            }
+            combo->setCurrentIndex(std::max(0, combo->findData(QString::fromStdString(selected))));
+            return combo;
+        };
+        add_heading(Ui::tr("我说的语言"));
+        translation_source_ = make_language_combo(translation.direction.source);
+        layout->addWidget(translation_source_);
+        add_heading(Ui::tr("翻译成"));
+        translation_target_ = make_language_combo(translation.direction.target);
+        layout->addWidget(translation_target_);
+        const auto languages_changed = [this] {
+            if (models_page_ != nullptr) {
+                models_page_->setLanguages(languageCode(translation_source_), languageCode(translation_target_));
+            }
+        };
+        connect(translation_source_, qOverload<int>(&QComboBox::currentIndexChanged), this, languages_changed);
+        connect(translation_target_, qOverload<int>(&QComboBox::currentIndexChanged), this, languages_changed);
 
-        add_heading(QStringLiteral("原文与译文之间的分隔符"));
+        add_heading(Ui::tr("原文与译文之间的分隔符"));
         translation_separator_ = new QLineEdit(translation.separator);
         translation_separator_->setMaxLength(8);
+#ifndef __APPLE__
         translation_separator_->setStyleSheet(QStringLiteral(
             "QLineEdit { min-height: 32px; padding: 0 9px; border: 1px solid #D7DAE0; border-radius: 5px; background: #FFFFFF; color: #30343A; }"
             "QLineEdit:focus { border: 1px solid #356AE6; }"));
+#endif
         layout->addWidget(translation_separator_);
 
         auto* example = new QLabel;
         example->setWordWrap(true);
-        example->setStyleSheet(QStringLiteral("color: #69707A;"));
+        example->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
         layout->addWidget(example);
         const auto update_example = [this, example] {
-            const bool zh_to_en = translation_direction_->currentIndex() == 0;
+            const bool zh_to_en = languageCode(translation_source_) == QStringLiteral("zh");
             const QString separator = sanitizedSeparator(translation_separator_->text());
-            example->setText(QStringLiteral("示例：%1")
+            example->setText(Ui::tr("示例：%1")
                                  .arg(zh_to_en
-                                     ? QStringLiteral("今天开会。") + separator +
+                                     ? Ui::tr("今天开会。") + separator +
                                          QStringLiteral("We have a meeting today.")
                                      : QStringLiteral("See you tomorrow.") + separator +
-                                         QStringLiteral("明天见。")));
+                                         Ui::tr("明天见。")));
         };
-        connect(translation_direction_, qOverload<int>(&QComboBox::currentIndexChanged),
+        connect(translation_source_, qOverload<int>(&QComboBox::currentIndexChanged),
                 this, update_example);
         connect(translation_separator_, &QLineEdit::textChanged, this, update_example);
         update_example();
 
-        auto* note = new QLabel(QStringLiteral(
+        auto* note = new QLabel(Ui::tr(
             "翻译失败、超时或说的语言与方向不符时，只输入原文。"));
         note->setWordWrap(true);
-        note->setStyleSheet(QStringLiteral("color: #69707A;"));
+        note->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
         layout->addWidget(note);
         layout->addStretch();
         return page;
@@ -2072,6 +2276,7 @@ private:
         if (speech_enabled_checkbox_ == nullptr) return;
         const bool translation = translation_enabled_checkbox_->isChecked();
         speech_enabled_checkbox_->setEnabled(translation);
+        if (speech_live_checkbox_ != nullptr) speech_live_checkbox_->setEnabled(translation);
         speech_requires_translation_->setVisible(!translation);
     }
 
@@ -2079,48 +2284,57 @@ private:
         auto* page = new QWidget;
         auto* layout = pageLayout(page);
 
-        QVBoxLayout* switch_card = addCard(layout, QStringLiteral("朗读译文"),
-            QStringLiteral("松开快捷键后，把这一段的译文念到朗读设备，通话对方就能听到。翻译失败时不朗读。"));
-        speech_enabled_checkbox_ = new QCheckBox(QStringLiteral("开启朗读"));
+        QVBoxLayout* switch_card = addCard(layout, Ui::tr("朗读译文"),
+            Ui::tr("松开快捷键后，把这一段的译文念到朗读设备，通话对方就能听到。翻译失败时不朗读。"));
+        speech_enabled_checkbox_ = new QCheckBox(Ui::tr("开启朗读"));
         speech_enabled_checkbox_->setChecked(speech.enabled);
         switch_card->addWidget(speech_enabled_checkbox_);
-        speech_requires_translation_ = new QLabel(QStringLiteral("需要先在「翻译」页开启翻译模式。"));
+        speech_live_checkbox_ = new QCheckBox(Ui::tr("边说边朗读：每句翻译好就开始念，不等松开快捷键"));
+        speech_live_checkbox_->setChecked(speech.live);
+        speech_live_checkbox_->setToolTip(Ui::tr(
+            "说话中间停顿时，前面的句子就会被翻译并念出来。按 Esc 可取消还没念出的部分。"));
+        switch_card->addWidget(speech_live_checkbox_);
+        speech_requires_translation_ = new QLabel(Ui::tr("需要先在「翻译」页开启翻译模式。"));
         speech_requires_translation_->setWordWrap(true);
         speech_requires_translation_->setStyleSheet(QStringLiteral("color: #C77A14;"));
         switch_card->addWidget(speech_requires_translation_);
 
-        QVBoxLayout* device_card = addCard(layout, QStringLiteral("朗读设备"),
-            QStringLiteral("通常选虚拟声卡（如 CABLE Input），再在通话软件里把麦克风选成它对应的输入（如 CABLE Output）。"));
+        QVBoxLayout* device_card = addCard(layout, Ui::tr("朗读设备"),
+#ifdef __APPLE__
+            Ui::tr("选择 SpeakAnything Virtual Mic，再在通话软件里把麦克风也选成 SpeakAnything Virtual Mic。"));
+#else
+            Ui::tr("通常选虚拟声卡（如 CABLE Input），再在通话软件里把麦克风选成它对应的输入（如 CABLE Output）。"));
+#endif
         speech_device_ = new QComboBox;
-        speech_device_->addItem(QStringLiteral("（未选择）"), QString{});
+        speech_device_->addItem(Ui::tr("（未选择）"), QString{});
         for (const AudioOutputDevice& device : list_audio_output_devices()) {
             speech_device_->addItem(QString::fromStdWString(device.name), QString::fromStdWString(device.id));
         }
         if (!speech.device_id.isEmpty() && speech_device_->findData(speech.device_id) < 0) {
-            speech_device_->addItem(QStringLiteral("之前选择的设备（当前不可用）"), speech.device_id);
+            speech_device_->addItem(Ui::tr("之前选择的设备（当前不可用）"), speech.device_id);
         }
         speech_device_->setCurrentIndex(std::max(0, speech_device_->findData(speech.device_id)));
-        addRow(device_card, QStringLiteral("设备"), speech_device_);
-        speech_monitor_checkbox_ = new QCheckBox(QStringLiteral("监听：同时在自己的默认播放设备上播放"));
+        addRow(device_card, Ui::tr("设备"), speech_device_);
+        speech_monitor_checkbox_ = new QCheckBox(Ui::tr("监听：同时在自己的默认播放设备上播放"));
         speech_monitor_checkbox_->setChecked(speech.monitor);
-        speech_monitor_checkbox_->setToolTip(QStringLiteral("录音期间自动静音，避免被重新录进去。"));
+        speech_monitor_checkbox_->setToolTip(Ui::tr("录音期间自动静音，避免被重新录进去。"));
         device_card->addWidget(speech_monitor_checkbox_);
 
-        QVBoxLayout* voice_card = addCard(layout, QStringLiteral("声音"),
-            QStringLiteral("中文 → 英文时用英文声音，英文 → 中文时用中文声音。"));
+        QVBoxLayout* voice_card = addCard(layout, Ui::tr("声音"),
+            Ui::tr("中文 → 英文时用英文声音，英文 → 中文时用中文声音。"));
         speech_voice_en_ = new QComboBox;
-        speech_voice_en_->addItem(QStringLiteral("美式女声 Maple"), 0);
-        speech_voice_en_->addItem(QStringLiteral("美式女声 Sol"), 1);
-        speech_voice_en_->addItem(QStringLiteral("英式女声 Vale"), 2);
+        speech_voice_en_->addItem(Ui::tr("美式女声 Maple"), 0);
+        speech_voice_en_->addItem(Ui::tr("美式女声 Sol"), 1);
+        speech_voice_en_->addItem(Ui::tr("英式女声 Vale"), 2);
         speech_voice_en_->setCurrentIndex(std::max(0, speech_voice_en_->findData(speech.voice_en)));
-        addRow(voice_card, QStringLiteral("英文声音"), speech_voice_en_);
+        addRow(voice_card, Ui::tr("英文声音"), speech_voice_en_);
         speech_voice_zh_ = new QComboBox;
         for (const auto& [id, name] : kokoroChineseVoices()) speech_voice_zh_->addItem(name, id);
         speech_voice_zh_->setCurrentIndex(std::max(0, speech_voice_zh_->findData(speech.voice_zh)));
-        addRow(voice_card, QStringLiteral("中文声音"), speech_voice_zh_);
+        addRow(voice_card, Ui::tr("中文声音"), speech_voice_zh_);
         auto* speed_layout = new QVBoxLayout;
         voice_card->addLayout(speed_layout);
-        speech_speed_slider_ = addSlider(speed_layout, QStringLiteral("语速"), 50, 200, 10,
+        speech_speed_slider_ = addSlider(speed_layout, Ui::tr("语速"), 50, 200, 10,
                                          speech.speed_percent, ValueFormat::Speed);
         layout->addStretch();
         return page;
@@ -2133,13 +2347,14 @@ private:
         layout->setSpacing(8);
 
         hotword_table_ = new QTableWidget;
-        hotword_table_->setColumnCount(5);
+        hotword_table_->setColumnCount(6);
         hotword_table_->setHorizontalHeaderLabels({
-            QStringLiteral("启用"),
-            QStringLiteral("标准词"),
-            QStringLiteral("别名（用 | 分隔）"),
-            QStringLiteral("增强"),
-            QStringLiteral("命中"),
+            Ui::tr("启用"),
+            Ui::tr("标准词"),
+            Ui::tr("别名（用 | 分隔）"),
+            Ui::tr("增强"),
+            Ui::tr("命中"),
+            Ui::tr("不翻译"),
         });
         hotword_table_->verticalHeader()->setVisible(false);
         hotword_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -2149,6 +2364,7 @@ private:
         hotword_table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
         hotword_table_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
         hotword_table_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+        hotword_table_->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
         for (const HotwordEntry& entry : entries) addHotwordRow(entry);
         layout->addWidget(hotword_table_);
 
@@ -2156,10 +2372,10 @@ private:
         controls->setSpacing(6);
         auto* add_button = new QToolButton;
         add_button->setText(QStringLiteral("+"));
-        add_button->setToolTip(QStringLiteral("添加热词"));
+        add_button->setToolTip(Ui::tr("添加热词"));
         auto* remove_button = new QToolButton;
         remove_button->setIcon(style()->standardIcon(QStyle::SP_DialogDiscardButton));
-        remove_button->setToolTip(QStringLiteral("删除所选热词"));
+        remove_button->setToolTip(Ui::tr("删除所选热词"));
         controls->addWidget(add_button);
         controls->addWidget(remove_button);
         controls->addStretch();
@@ -2184,7 +2400,7 @@ private:
 
         auto* enabled = new QCheckBox;
         enabled->setChecked(entry.enabled);
-        enabled->setToolTip(QStringLiteral("启用热词"));
+        enabled->setToolTip(Ui::tr("启用热词"));
         hotword_table_->setCellWidget(row, 0, enabled);
 
         auto* phrase = new QTableWidgetItem(to_qstring(entry.phrase));
@@ -2199,13 +2415,18 @@ private:
         boost->setDecimals(1);
         boost->setSingleStep(0.5);
         boost->setValue(entry.boost);
-        boost->setToolTip(QStringLiteral("CTC 热词增强强度"));
+        boost->setToolTip(Ui::tr("CTC 热词增强强度"));
         hotword_table_->setCellWidget(row, 3, boost);
 
         auto* hits = new QTableWidgetItem(QString::number(entry.hits));
         hits->setFlags(hits->flags() & ~Qt::ItemIsEditable);
         hits->setTextAlignment(Qt::AlignCenter);
         hotword_table_->setItem(row, 4, hits);
+
+        auto* keep = new QCheckBox;
+        keep->setChecked(entry.keep_untranslated);
+        keep->setToolTip(Ui::tr("翻译时原样保留这个词（人名、产品名，如 Claude Code）"));
+        hotword_table_->setCellWidget(row, 5, keep);
     }
 
     QWidget* createVadPage(const VadSettings& values) {
@@ -2213,13 +2434,13 @@ private:
         auto* layout = new QVBoxLayout(page);
         layout->setContentsMargins(18, 18, 18, 16);
         layout->setSpacing(15);
-        endpoint_slider_ = addSlider(layout, QStringLiteral("句尾静音"), 300, 2000, 100,
+        endpoint_slider_ = addSlider(layout, Ui::tr("句尾静音"), 300, 2000, 100,
                                      values.endpoint_ms, ValueFormat::Milliseconds);
-        threshold_slider_ = addSlider(layout, QStringLiteral("模型阈值"), 5, 95, 5,
+        threshold_slider_ = addSlider(layout, Ui::tr("模型阈值"), 5, 95, 5,
                                       values.threshold_percent, ValueFormat::Threshold);
-        minimum_db_slider_ = addSlider(layout, QStringLiteral("最低响度"), -80, -20, 1,
+        minimum_db_slider_ = addSlider(layout, Ui::tr("最低响度"), -80, -20, 1,
                                        values.minimum_db, ValueFormat::Dbfs);
-        snr_slider_ = addSlider(layout, QStringLiteral("底噪余量"), 0, 20, 1,
+        snr_slider_ = addSlider(layout, Ui::tr("底噪余量"), 0, 20, 1,
                                 values.snr_db, ValueFormat::Db);
         layout->addStretch();
         return page;
@@ -2251,7 +2472,7 @@ private:
         auto* label = new QLabel(label_text);
         auto* value_label = new QLabel;
         value_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        value_label->setStyleSheet(QStringLiteral("color: #69707A;"));
+        value_label->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
         labels->addWidget(label);
         labels->addStretch();
         labels->addWidget(value_label);
@@ -2279,10 +2500,10 @@ private:
                 break;
             case ValueFormat::HalfSeconds:
                 value_label->setText(QString::number(current * linger_step_ms / 1000.0, 'f', 1) +
-                                     QStringLiteral(" 秒"));
+                                     Ui::tr(" 秒"));
                 break;
             case ValueFormat::Speed:
-                value_label->setText(QStringLiteral("%1 倍").arg(current / 100.0, 0, 'f', 1));
+                value_label->setText(Ui::tr("%1 倍").arg(current / 100.0, 0, 'f', 1));
                 break;
             }
         };
@@ -2312,9 +2533,25 @@ private:
     QSlider* paste_delay_slider_ = nullptr;
     QTableWidget* hotword_table_ = nullptr;
     QCheckBox* translation_enabled_checkbox_ = nullptr;
-    QComboBox* translation_direction_ = nullptr;
+    QComboBox* translation_source_ = nullptr;
+    QComboBox* translation_target_ = nullptr;
+    ModelManager* model_manager_ = nullptr;
+    ModelChoices initial_model_choices_;
+    ModelsPage* models_page_ = nullptr;
+
+    static QString languageCode(const QComboBox* combo) {
+        return combo->currentData().toString();
+    }
+
+public:
+    [[nodiscard]] ModelChoices modelChoices() const {
+        return models_page_ != nullptr ? models_page_->choices() : initial_model_choices_;
+    }
+
+private:
     QLineEdit* translation_separator_ = nullptr;
     QCheckBox* speech_enabled_checkbox_ = nullptr;
+    QCheckBox* speech_live_checkbox_ = nullptr;
     QLabel* speech_requires_translation_ = nullptr;
     QComboBox* speech_device_ = nullptr;
     QCheckBox* speech_monitor_checkbox_ = nullptr;
@@ -2361,9 +2598,16 @@ public:
         resize(bubble_minimum_width + window_margin * 2,
                bubble_minimum_height + 48 + control_spacing + window_margin * 2);
         setFocusPolicy(Qt::NoFocus);
+        model_manager_ = new ModelManager(QDir(dataDirectory()).filePath(QStringLiteral("models")), this);
+        model_manager_->addFinishedHandler([this](const QString&, bool ok, const QString&) {
+            if (ok) applyModelChoices();
+        });
         loadSettings();
         buildUi();
-        if (!preview_mode_) buildTrayMenu();
+        if (!preview_mode_) {
+            buildTrayMenu();
+            watchScreens();
+        }
         centerNearBottom();
 
         translation_deadline_.setSingleShot(true);
@@ -2383,7 +2627,7 @@ public:
                 else refreshTranscript();
             }
         });
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
         if (!preview_mode_) {
             hotkey_hold_timer_.setSingleShot(true);
             connect(&hotkey_hold_timer_, &QTimer::timeout, this, [this] { beginHotkeySession(); });
@@ -2401,7 +2645,7 @@ public:
         if (preview_mode_) {
             state_ = State::Ready;
             recording_control_->setEnabled(true);
-            setBubbleStatus(QStringLiteral("这一句用于比较浮窗方案的文字布局。说长一点时，气泡会自动扩展，不滚动，也不会裁切内容。"));
+            setBubbleStatus(Ui::tr("这一句用于比较浮窗方案的文字布局。说长一点时，气泡会自动扩展，不滚动，也不会裁切内容。"));
         } else {
             beginLoadModels();
         }
@@ -2413,7 +2657,7 @@ public:
         translation_deadline_.stop();
         meter_timer_.stop();
         status_reset_timer_.stop();
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
         hotkey_hold_timer_.stop();
         hotkey_release_timer_.stop();
         uninstallKeyboardHook();
@@ -2517,21 +2761,21 @@ protected:
 
     void contextMenuEvent(QContextMenuEvent* event) override {
         QMenu menu(this);
-        QAction* settings_action = menu.addAction(QStringLiteral("设置..."));
-        QAction* cancel_action = menu.addAction(QStringLiteral("取消本次输入"));
+        QAction* settings_action = menu.addAction(Ui::tr("设置..."));
+        QAction* cancel_action = menu.addAction(Ui::tr("取消本次输入"));
         cancel_action->setEnabled(state_ == State::Listening);
-        QAction* copy_action = menu.addAction(QStringLiteral("复制当前文字"));
+        QAction* copy_action = menu.addAction(Ui::tr("复制当前文字"));
         copy_action->setEnabled(!currentTranscript().trimmed().isEmpty());
-        QMenu* recent_menu = menu.addMenu(QStringLiteral("最近输入"));
+        QMenu* recent_menu = menu.addMenu(Ui::tr("最近输入"));
         populateRecentMenu(recent_menu);
         menu.addSeparator();
-        QAction* exit_action = menu.addAction(QStringLiteral("退出"));
+        QAction* exit_action = menu.addAction(Ui::tr("退出"));
         QAction* selected = menu.exec(event->globalPos());
         if (selected == settings_action) openSettings();
         else if (selected == cancel_action) stopSession(false);
         else if (selected == copy_action) {
             QApplication::clipboard()->setText(currentTranscript().trimmed());
-            setTransientStatus(QStringLiteral("已复制当前文字"));
+            setTransientStatus(Ui::tr("已复制当前文字"));
         }
         else if (selected == exit_action) close();
     }
@@ -2559,6 +2803,11 @@ protected:
     bool nativeEvent(const QByteArray& event_type, void* message, qintptr* result) override {
         (void)event_type;
         auto* native_message = static_cast<MSG*>(message);
+        if (native_message->message == WM_HOTKEY && native_message->wParam == hotkey_cancel_id) {
+            if (result != nullptr) *result = 0;
+            cancelTake();
+            return true;
+        }
         if (native_message->message == WM_HOTKEY &&
             (native_message->wParam == hotkey_primary_id ||
              native_message->wParam == hotkey_left_id ||
@@ -2584,12 +2833,12 @@ private:
 
     void setPreviewGeometryStep(int step) {
         static const std::array<QString, 6> samples = {
-            QStringLiteral("短句"),
-            QStringLiteral("文字逐步变长"),
-            QStringLiteral("文字逐步变长时窗口视觉中心应该保持不动"),
-            QStringLiteral("文字逐步变长时窗口视觉中心应该保持不动，底边也应该保持不动。"),
-            QStringLiteral("这是一个更长的预览句子，用来验证窗口宽高动画不会导致水平抖动。"),
-            QStringLiteral("这是一个更长的预览句子，用来验证窗口宽高动画不会导致水平抖动，内容变成多行后仍然保持稳定。"),
+            Ui::tr("短句"),
+            Ui::tr("文字逐步变长"),
+            Ui::tr("文字逐步变长时窗口视觉中心应该保持不动"),
+            Ui::tr("文字逐步变长时窗口视觉中心应该保持不动，底边也应该保持不动。"),
+            Ui::tr("这是一个更长的预览句子，用来验证窗口宽高动画不会导致水平抖动。"),
+            Ui::tr("这是一个更长的预览句子，用来验证窗口宽高动画不会导致水平抖动，内容变成多行后仍然保持稳定。"),
         };
         if (step >= static_cast<int>(samples.size())) return;
         setPreviewContent(samples[static_cast<std::size_t>(step)]);
@@ -2607,7 +2856,7 @@ private:
         root->setAlignment(Qt::AlignHCenter);
 
         transcript_ = new TranscriptBubble(bubble_style_);
-        setBubbleStatus(QStringLiteral("正在加载..."));
+        setBubbleStatus(Ui::tr("正在加载..."));
 
         recording_control_ = new RecordingControl(bubble_style_);
         recording_control_->setEnabled(false);
@@ -2632,9 +2881,7 @@ private:
         recording_control_->setTranslationHandlers(
             [this] { setTranslationEnabled(!translation_settings_.enabled); },
             [this] {
-                setTranslationDirection(translation_settings_.direction == TranslationDirection::ZhToEn
-                    ? TranslationDirection::EnToZh
-                    : TranslationDirection::ZhToEn);
+                setTranslationDirection(translation_settings_.direction.reversed());
             });
     }
 
@@ -2643,33 +2890,74 @@ private:
         tray_icon_->setIcon(sensevoiceIcon());
         tray_icon_->setToolTip(QStringLiteral("SenseVoice 语音输入"));
         auto* tray_menu = new QMenu(this);
-        QAction* settings_action = tray_menu->addAction(QStringLiteral("设置..."));
-        QAction* show_action = tray_menu->addAction(QStringLiteral("显示输入窗"));
-        history_menu_ = tray_menu->addMenu(QStringLiteral("最近输入"));
+        QAction* settings_action = tray_menu->addAction(Ui::tr("设置..."));
+        QAction* show_action = tray_menu->addAction(Ui::tr("显示输入窗"));
+        history_menu_ = tray_menu->addMenu(Ui::tr("最近输入"));
         populateRecentMenu(history_menu_);
         tray_menu->addSeparator();
-        tray_translation_action_ = tray_menu->addAction(QStringLiteral("翻译模式"));
+        tray_translation_action_ = tray_menu->addAction(Ui::tr("翻译模式"));
         tray_translation_action_->setCheckable(true);
-        QMenu* direction_menu = tray_menu->addMenu(QStringLiteral("翻译方向"));
+        QMenu* direction_menu = tray_menu->addMenu(Ui::tr("翻译方向"));
         auto* direction_group = new QActionGroup(direction_menu);
-        tray_zh_en_action_ = direction_menu->addAction(QStringLiteral("中文 → 英文"));
-        tray_en_zh_action_ = direction_menu->addAction(QStringLiteral("英文 → 中文"));
+        tray_zh_en_action_ = direction_menu->addAction(Ui::tr("中文 → 英文"));
+        tray_en_zh_action_ = direction_menu->addAction(Ui::tr("英文 → 中文"));
         for (QAction* action : {tray_zh_en_action_, tray_en_zh_action_}) {
             action->setCheckable(true);
             direction_group->addAction(action);
         }
         connect(tray_translation_action_, &QAction::triggered, this,
                 [this](bool checked) { setTranslationEnabled(checked); });
-        connect(tray_zh_en_action_, &QAction::triggered, this,
-                [this] { setTranslationDirection(TranslationDirection::ZhToEn); });
-        connect(tray_en_zh_action_, &QAction::triggered, this,
-                [this] { setTranslationDirection(TranslationDirection::EnToZh); });
-        QAction* stop_speech_action = tray_menu->addAction(QStringLiteral("停止朗读"));
+        // The two entries are the current direction and its reverse.
+        connect(tray_zh_en_action_, &QAction::triggered, this, [this] {
+            updateTranslationUi();
+        });
+        connect(tray_en_zh_action_, &QAction::triggered, this, [this] {
+            setTranslationDirection(translation_settings_.direction.reversed());
+        });
+        tray_speech_action_ = tray_menu->addAction(Ui::tr("朗读译文"));
+        tray_speech_action_->setCheckable(true);
+        tray_speech_action_->setChecked(speech_settings_.enabled);
+        connect(tray_speech_action_, &QAction::triggered, this, [this](bool checked) {
+            speech_settings_.enabled = checked;
+            if (checked && !translation_settings_.enabled) setTranslationEnabled(true);
+            saveSettings();
+            applySpeechSettings();
+        });
+        QAction* mute_action = tray_menu->addAction(Ui::tr("录音时静音系统声音"));
+        mute_action->setCheckable(true);
+        mute_action->setChecked(mute_while_recording_);
+        mute_action->setToolTip(Ui::tr("用扬声器时开启，避免声音被重新录进去；戴耳机时可以关闭。"));
+        connect(mute_action, &QAction::triggered, this, [this](bool checked) {
+            mute_while_recording_ = checked;
+            saveSettings();
+        });
+        QAction* stop_speech_action = tray_menu->addAction(Ui::tr("停止朗读"));
         connect(stop_speech_action, &QAction::triggered, this, [this] {
             if (speech_queue_ != nullptr) speech_queue_->clear();
         });
+        QMenu* language_menu = tray_menu->addMenu(QStringLiteral("Language / 语言"));
+        auto* language_group = new QActionGroup(language_menu);
+        const QString current_language = uiLanguageSetting();
+        const std::array<std::pair<QString, QString>, 3> languages = {{
+            {QStringLiteral("auto"), Ui::tr("跟随系统")},
+            {QStringLiteral("zh"), QStringLiteral("中文")},
+            {QStringLiteral("en"), QStringLiteral("English")},
+        }};
+        for (const auto& [code, label] : languages) {
+            QAction* action = language_menu->addAction(label);
+            action->setCheckable(true);
+            action->setChecked(code == current_language);
+            language_group->addAction(action);
+            connect(action, &QAction::triggered, this, [this, code] {
+                if (code == uiLanguageSetting()) return;
+                QSettings(QStringLiteral("SenseVoice"), QStringLiteral("LocalDictation"))
+                    .setValue(QStringLiteral("ui/language"), code);
+                QMessageBox::information(this, QStringLiteral("SpeakAnything"),
+                    QStringLiteral("Restart SpeakAnything to change the language.\n重启 SpeakAnything 后切换语言。"));
+            });
+        }
         tray_menu->addSeparator();
-        QAction* exit_action = tray_menu->addAction(QStringLiteral("退出"));
+        QAction* exit_action = tray_menu->addAction(Ui::tr("退出"));
         connect(settings_action, &QAction::triggered, this, [this] { openSettings(); });
         connect(show_action, &QAction::triggered, this, [this] {
             showPopup();
@@ -2695,7 +2983,7 @@ private:
         menu->clear();
         const QStringList entries = settings_.value(QStringLiteral("history/entries")).toStringList();
         if (entries.isEmpty()) {
-            QAction* empty_action = menu->addAction(QStringLiteral("暂无记录"));
+            QAction* empty_action = menu->addAction(Ui::tr("暂无记录"));
             empty_action->setEnabled(false);
             return;
         }
@@ -2706,7 +2994,7 @@ private:
             action->setToolTip(entry);
             connect(action, &QAction::triggered, this, [this, entry] {
                 QApplication::clipboard()->setText(entry);
-                setTransientStatus(QStringLiteral("已复制最近输入"));
+                setTransientStatus(Ui::tr("已复制最近输入"));
             });
         }
     }
@@ -2721,10 +3009,45 @@ private:
     }
 
     void showPopup() {
-        if (isVisible()) return;
+        // A display that went away can leave a "visible" popup off every screen.
+        if (isVisible() && onAnyScreen()) return;
         geometry_anchor_valid_ = false;
         centerNearBottom();
         show();
+#ifdef __APPLE__
+        macos_make_overlay_window(static_cast<std::uintptr_t>(winId()));
+#endif
+        raise();
+    }
+
+    bool onAnyScreen() const {
+        const QRect frame = frameGeometry();
+        for (QScreen* screen : QGuiApplication::screens()) {
+            if (screen->availableGeometry().intersects(frame)) return true;
+        }
+        return false;
+    }
+
+    // Monitors plugged, unplugged or rearranged: bring the popup back onto a
+    // screen instead of leaving it where a display used to be.
+    void watchScreens() {
+        const auto recover = [this] {
+            QTimer::singleShot(250, this, [this] {
+                if (!isVisible() || onAnyScreen()) return;
+                geometry_anchor_valid_ = false;
+                centerNearBottom();
+            });
+        };
+        const auto watch = [this, recover](QScreen* screen) {
+            connect(screen, &QScreen::availableGeometryChanged, this, recover);
+        };
+        for (QScreen* screen : QGuiApplication::screens()) watch(screen);
+        connect(qApp, &QGuiApplication::screenAdded, this, [watch, recover](QScreen* screen) {
+            watch(screen);
+            recover();
+        });
+        connect(qApp, &QGuiApplication::screenRemoved, this, recover);
+        connect(qApp, &QGuiApplication::primaryScreenChanged, this, recover);
     }
 
     void hidePopup() {
@@ -2735,7 +3058,9 @@ private:
     }
 
     void loadSettings() {
-        vad_settings_.endpoint_ms = settings_.value(QStringLiteral("vad/endpoint_ms"), 700).toInt();
+        loadModelChoices();
+        vad_settings_.endpoint_ms =
+            settings_.value(QStringLiteral("vad/endpoint_ms"), default_endpoint_ms).toInt();
         vad_settings_.threshold_percent = settings_.value(QStringLiteral("vad/threshold_percent"), 55).toInt();
         vad_settings_.minimum_db = settings_.value(QStringLiteral("vad/minimum_db"), -60).toInt();
         vad_settings_.snr_db = settings_.value(QStringLiteral("vad/snr_db"), 3).toInt();
@@ -2752,7 +3077,13 @@ private:
             settings_.setValue(QStringLiteral("vad/minimum_db"), vad_settings_.minimum_db);
             settings_.setValue(QStringLiteral("vad/snr_db"), vad_settings_.snr_db);
         }
-        settings_.setValue(QStringLiteral("vad/profile_version"), 4);
+        // Profile 5: macOS moved from 700 ms to a longer sentence-end silence;
+        // only an untouched old default is migrated.
+        if (profile_version < 5 && vad_settings_.endpoint_ms == 700 && default_endpoint_ms != 700) {
+            vad_settings_.endpoint_ms = default_endpoint_ms;
+            settings_.setValue(QStringLiteral("vad/endpoint_ms"), vad_settings_.endpoint_ms);
+        }
+        settings_.setValue(QStringLiteral("vad/profile_version"), 5);
         settings_.sync();
         translation_settings_.enabled =
             settings_.value(QStringLiteral("translation/enabled"), false).toBool();
@@ -2764,6 +3095,15 @@ private:
             QStringLiteral("translation/separator"),
             QString::fromLatin1(default_translation_separator)).toString());
         speech_settings_.enabled = settings_.value(QStringLiteral("speech/enabled"), false).toBool();
+#ifdef __APPLE__
+        // Mac users mostly dictate on headphones or with echo cancellation, and
+        // a muted Mac looks broken; Windows keeps its original behaviour.
+        constexpr bool default_mute_while_recording = false;
+#else
+        constexpr bool default_mute_while_recording = true;
+#endif
+        mute_while_recording_ = settings_.value(
+            QStringLiteral("audio/mute_while_recording"), default_mute_while_recording).toBool();
         speech_settings_.device_id = settings_.value(QStringLiteral("speech/device_id")).toString();
         speech_settings_.monitor = settings_.value(QStringLiteral("speech/monitor"), false).toBool();
         speech_settings_.voice_zh =
@@ -2772,14 +3112,13 @@ private:
             settings_.value(QStringLiteral("speech/voice_en"), default_speech_voice_en).toInt();
         speech_settings_.speed_percent =
             std::clamp(settings_.value(QStringLiteral("speech/speed_percent"), 100).toInt(), 50, 200);
+        speech_settings_.live = settings_.value(QStringLiteral("speech/live"), false).toBool();
         hotkey_shortcut_ = canonicalShortcut(settings_.value(
             QStringLiteral("hotkey/shortcut"), QString::fromLatin1(default_hotkey)).toString());
         if (!hasUsableShortcutKey(hotkey_shortcut_)) {
             hotkey_shortcut_ = QString::fromLatin1(default_hotkey);
         }
-#ifdef _WIN32
-        startup_enabled_ = windowsStartupEnabled();
-#endif
+        startup_enabled_ = platformStartupEnabled();
         // Older builds stored one combined value; map it onto destination + content.
         const QString destination_value =
             settings_.value(QStringLiteral("output/destination"), QStringLiteral("insert")).toString();
@@ -2842,9 +3181,9 @@ private:
         updateWindowGeometry();
     }
 
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
     // In toggle mode the stop press may still be held; Ctrl+V must not mix with it.
-    void pasteWhenKeysReleased(std::uint64_t session_id, const WindowsTextInputTarget& target,
+    void pasteWhenKeysReleased(std::uint64_t session_id, const TextInputTarget& target,
                                const QString& text, const QString& notice, int attempts_left) {
         if (shutting_down_.load(std::memory_order_acquire) || session_id != session_generation_) return;
         if (hotkeyKeysDown() && attempts_left > 0) {
@@ -2854,42 +3193,46 @@ private:
             return;
         }
         const bool pasted = !hotkeyKeysDown() && usableInjectionTarget(target) &&
-            paste_clipboard_into_windows_text_input(target, GetCurrentProcessId());
+            paste_clipboard_into_text_input(target, current_process_id());
         reportInjection(session_id, target, text, notice, pasted);
     }
 
-    void reportInjection(std::uint64_t session_id, const WindowsTextInputTarget& target,
+    void reportInjection(std::uint64_t session_id, const TextInputTarget& target,
                          const QString& text, const QString& notice, bool injected) {
         if (injected) {
+#ifdef _WIN32
             last_target_ = {
                 .window = target.window,
                 .focus = target.focus,
                 .process_id = target.process_id,
                 .thread_id = target.thread_id,
             };
-            recording_control_->setToolTip(QStringLiteral("已输入到光标位置"));
+#else
+            last_target_ = target;
+#endif
+            recording_control_->setToolTip(Ui::tr("已输入到光标位置"));
             if (notice.isEmpty()) scheduleLingerHide(session_id);
             else showTranslationNotice(text, notice);
             return;
         }
-        recording_control_->setToolTip(QStringLiteral("已复制到剪贴板"));
+        recording_control_->setToolTip(Ui::tr("已复制到剪贴板"));
         if (state_ == State::Ready) {
             showPopup();
-            setBubbleStatus(QStringLiteral("注入失败，已复制到剪贴板"));
+            setBubbleStatus(Ui::tr("注入失败，已复制到剪贴板"));
             scheduleLingerHide(session_id);
         }
     }
 #endif
 
     QString idleHint() const {
-        return (hotkey_trigger_ == HotkeyTrigger::Toggle ? QStringLiteral("按 %1 开始说话")
-                                                        : QStringLiteral("按住 %1"))
+        return (hotkey_trigger_ == HotkeyTrigger::Toggle ? Ui::tr("按 %1 开始说话")
+                                                        : Ui::tr("按住 %1"))
             .arg(shortcutDisplayName(hotkey_shortcut_));
     }
 
     QString listeningHint() const {
-        if (!toggle_active_) return QStringLiteral("正在听取...");
-        return QStringLiteral("正在听取...再按 %1 结束").arg(shortcutDisplayName(hotkey_shortcut_));
+        if (!toggle_active_) return Ui::tr("正在听取...");
+        return Ui::tr("正在听取...再按 %1 结束").arg(shortcutDisplayName(hotkey_shortcut_));
     }
 
     void scheduleLingerHide(std::uint64_t session_id) {
@@ -2900,7 +3243,29 @@ private:
         });
     }
 
+    void loadModelChoices() {
+        for (const auto& [group, map] : {std::pair{QStringLiteral("models/recognizer"), &model_choices_.recognizer},
+                                         std::pair{QStringLiteral("models/voice"), &model_choices_.voice}}) {
+            settings_.beginGroup(group);
+            for (const QString& key : settings_.childKeys()) map->insert(key, settings_.value(key).toString());
+            settings_.endGroup();
+        }
+        model_choices_.translator =
+            settings_.value(QStringLiteral("models/translator"), QStringLiteral("auto")).toString();
+    }
+
+    void saveModelChoices() {
+        for (const auto& [group, map] : {std::pair{QStringLiteral("models/recognizer"), &model_choices_.recognizer},
+                                         std::pair{QStringLiteral("models/voice"), &model_choices_.voice}}) {
+            settings_.beginGroup(group);
+            for (auto it = map->begin(); it != map->end(); ++it) settings_.setValue(it.key(), it.value());
+            settings_.endGroup();
+        }
+        settings_.setValue(QStringLiteral("models/translator"), model_choices_.translator);
+    }
+
     void saveSettings() {
+        saveModelChoices();
         settings_.setValue(QStringLiteral("vad/endpoint_ms"), vad_settings_.endpoint_ms);
         settings_.setValue(QStringLiteral("vad/threshold_percent"), vad_settings_.threshold_percent);
         settings_.setValue(QStringLiteral("vad/minimum_db"), vad_settings_.minimum_db);
@@ -2917,11 +3282,13 @@ private:
                                                                     : QStringLiteral("hold"));
         settings_.setValue(QStringLiteral("output/paste_delay_ms"), paste_delay_ms_);
         settings_.setValue(QStringLiteral("speech/enabled"), speech_settings_.enabled);
+        settings_.setValue(QStringLiteral("audio/mute_while_recording"), mute_while_recording_);
         settings_.setValue(QStringLiteral("speech/device_id"), speech_settings_.device_id);
         settings_.setValue(QStringLiteral("speech/monitor"), speech_settings_.monitor);
         settings_.setValue(QStringLiteral("speech/voice_zh"), speech_settings_.voice_zh);
         settings_.setValue(QStringLiteral("speech/voice_en"), speech_settings_.voice_en);
         settings_.setValue(QStringLiteral("speech/speed_percent"), speech_settings_.speed_percent);
+        settings_.setValue(QStringLiteral("speech/live"), speech_settings_.live);
         settings_.sync();
     }
 
@@ -2929,7 +3296,7 @@ private:
         if (preview_mode_) return;
         settings_.setValue(QStringLiteral("translation/enabled"), translation_settings_.enabled);
         settings_.setValue(QStringLiteral("translation/direction"),
-                           QString::fromLatin1(direction_code(translation_settings_.direction)));
+                           QString::fromStdString(direction_code(translation_settings_.direction)));
         settings_.setValue(QStringLiteral("translation/separator"), translation_settings_.separator);
         settings_.sync();
     }
@@ -2937,7 +3304,7 @@ private:
     void openSettings() {
         if (state_ == State::Listening || state_ == State::Stopping) return;
         if (state_ == State::Loading) {
-            setTransientStatus(QStringLiteral("模型加载中"));
+            setTransientStatus(Ui::tr("模型加载中"));
             return;
         }
         InputSettingsDialog dialog(
@@ -2948,9 +3315,11 @@ private:
                 applyAppearance();
                 saveAppearanceSettings();
             },
+            model_manager_, model_choices_,
             this);
         if (dialog.exec() == QDialog::Accepted) {
             speech_settings_ = dialog.speech();
+            model_choices_ = dialog.modelChoices();
             applyTranslationSettings(dialog.translation());
             vad_settings_ = dialog.values();
             text_mode_ = dialog.mode();
@@ -2962,35 +3331,40 @@ private:
             recording_control_->setMode(text_mode_);
             text_processor_.set_hotwords(dialog.hotwords());
             const QString selected_shortcut = dialog.shortcut();
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
             applyHotkey(selected_shortcut);
-            const bool requested_startup = dialog.startupEnabled();
-            if (!setWindowsStartupEnabled(requested_startup)) {
-                QMessageBox::warning(
-                    this, QStringLiteral("开机启动设置失败"),
-                    QStringLiteral("无法写入当前用户的 Windows 启动项。"));
-            } else {
-                startup_enabled_ = requested_startup;
-            }
 #else
             hotkey_shortcut_ = selected_shortcut;
 #endif
+            const bool requested_startup = dialog.startupEnabled();
+            if (!setPlatformStartupEnabled(requested_startup)) {
+                QMessageBox::warning(
+                    this, Ui::tr("开机启动设置失败"),
+#ifdef __APPLE__
+                    Ui::tr("无法注册登录项。"));
+#else
+                    Ui::tr("无法写入当前用户的 Windows 启动项。"));
+#endif
+            } else {
+                startup_enabled_ = requested_startup;
+            }
             saveSettings();
             std::string hotword_error;
             const std::filesystem::path hotword_path =
-                std::filesystem::path(QCoreApplication::applicationDirPath().toStdWString()) /
-                L"hotwords.tsv";
+                hotwordsPath(true);
             if (!text_processor_.save_hotwords(hotword_path, hotword_error)) {
-                QMessageBox::warning(this, QStringLiteral("热词未保存"), to_qstring(hotword_error));
+                QMessageBox::warning(this, Ui::tr("热词未保存"), to_qstring(hotword_error));
             }
-            setTransientStatus(QStringLiteral("已应用：%1")
+            setTransientStatus(Ui::tr("已应用：%1")
                                    .arg(shortcutDisplayName(hotkey_shortcut_)));
             QTimer::singleShot(1600, this, [this] { hidePopup(); });
         }
     }
 
     void centerNearBottom() {
-        QScreen* screen = QGuiApplication::primaryScreen();
+        // The screen the user is working on, not always the primary one.
+        QScreen* screen = QGuiApplication::screenAt(QCursor::pos());
+        if (screen == nullptr) screen = QGuiApplication::primaryScreen();
         if (screen == nullptr) return;
         const QRect area = screen->availableGeometry();
         move(area.center().x() - width() / 2, area.bottom() - height() - 72);
@@ -3117,7 +3491,7 @@ private:
         const bool registered = hotkey_primary_registered_ || hotkey_left_registered_ ||
             hotkey_right_registered_;
         if (!registered) {
-            recording_control_->setToolTip(QStringLiteral("系统快捷键被占用，已切换为后台按键监听"));
+            recording_control_->setToolTip(Ui::tr("系统快捷键被占用，已切换为后台按键监听"));
         }
     }
 
@@ -3164,7 +3538,7 @@ private:
         keyboard_hook_ = SetWindowsHookExW(
             WH_KEYBOARD_LL, keyboardHookProcedure, GetModuleHandleW(nullptr), 0);
         if (keyboard_hook_ == nullptr) {
-            recording_control_->setToolTip(QStringLiteral("按住快捷键监听失败，请点击开始"));
+            recording_control_->setToolTip(Ui::tr("按住快捷键监听失败，请点击开始"));
         }
     }
 
@@ -3204,7 +3578,7 @@ private:
         return key_down(static_cast<int>(hotkey_binding_.virtual_key));
     }
 
-    static bool usableInjectionTarget(const WindowsTextInputTarget& target) {
+    static bool usableInjectionTarget(const TextInputTarget& target) {
         if (!target.valid()) return false;
         const HWND window = reinterpret_cast<HWND>(target.window);
         if (window == nullptr || IsWindow(window) == FALSE ||
@@ -3213,15 +3587,65 @@ private:
         }
         DWORD process_id = 0;
         if (GetWindowThreadProcessId(window, &process_id) == 0 ||
-            process_id == GetCurrentProcessId()) {
+            process_id == current_process_id()) {
             return false;
         }
         return target.process_id == 0 || target.process_id == process_id;
     }
 
+#elif defined(__APPLE__)
+    void rebuildHotkeyBinding() {}
+
+    void registerHotkeys() {
+        const QKeySequence sequence = QKeySequence::fromString(
+            hotkey_shortcut_, QKeySequence::PortableText);
+        const bool registered = mac_hotkey_.set_shortcut(sequence, [this] {
+            QMetaObject::invokeMethod(this, [this] { handleHotkeyPressed(); }, Qt::QueuedConnection);
+        });
+        if (!registered) {
+            recording_control_->setToolTip(Ui::tr("系统快捷键被占用，请在设置中更换"));
+        }
+    }
+
+    void unregisterHotkeys() {
+        mac_hotkey_.clear();
+    }
+
+    void applyHotkey(const QString& requested_shortcut) {
+        const QString canonical = canonicalShortcut(requested_shortcut);
+        if (!hasUsableShortcutKey(canonical)) return;
+        if (canonical == hotkey_shortcut_ && mac_hotkey_.registered()) return;
+
+        hotkey_hold_timer_.stop();
+        hotkey_release_timer_.stop();
+        hotkey_pending_ = false;
+        hotkey_recording_ = false;
+        unregisterHotkeys();
+        hotkey_shortcut_ = canonical;
+        registerHotkeys();
+    }
+
+    // Carbon hot keys need no event tap; ask for Accessibility up front so the
+    // first dictation can be typed into the focused field.
+    void installKeyboardHook() {
+        macos_accessibility_trusted(true);
+    }
+
+    void uninstallKeyboardHook() {}
+
+    bool hotkeyKeysDown() const {
+        return mac_hotkey_.keys_down();
+    }
+
+    static bool usableInjectionTarget(const TextInputTarget& target) {
+        return text_input_target_alive(target, current_process_id());
+    }
+#endif
+
+#ifdef SENSEVOICE_NATIVE_INPUT
     void selectInjectionTarget() {
-        const WindowsTextInputTarget captured =
-            capture_windows_text_input_target(GetCurrentProcessId());
+        const TextInputTarget captured =
+            capture_text_input_target(current_process_id());
         if (usableInjectionTarget(captured)) {
             target_ = captured;
         } else if (usableInjectionTarget(last_target_)) {
@@ -3241,11 +3665,11 @@ private:
         if (state_ == State::Ready) selectInjectionTarget();
         showPopup();
         if (state_ != State::Ready) {
-            if (state_ == State::Loading) setTransientStatus(QStringLiteral("模型加载中"));
+            if (state_ == State::Loading) setTransientStatus(Ui::tr("模型加载中"));
             return;
         }
         hotkey_pending_ = true;
-        setBubbleStatus(QStringLiteral("继续按住..."));
+        setBubbleStatus(Ui::tr("继续按住..."));
         hotkey_hold_timer_.start(280);
         hotkey_release_timer_.start();
     }
@@ -3257,8 +3681,8 @@ private:
         hotkey_release_timer_.start();
         if (toggle_active_) {
             if (state_ != State::Listening) return;
-            const WindowsTextInputTarget captured =
-                capture_windows_text_input_target(GetCurrentProcessId());
+            const TextInputTarget captured =
+                capture_text_input_target(current_process_id());
             if (usableInjectionTarget(captured)) {
                 target_ = captured;
                 inject_on_complete_ = true;
@@ -3270,7 +3694,7 @@ private:
         if (state_ == State::Ready) selectInjectionTarget();
         showPopup();
         if (state_ != State::Ready) {
-            if (state_ == State::Loading) setTransientStatus(QStringLiteral("模型加载中"));
+            if (state_ == State::Loading) setTransientStatus(Ui::tr("模型加载中"));
             return;
         }
         startSession(true);
@@ -3286,7 +3710,7 @@ private:
         if (!hotkeyKeysDown()) {
             hotkey_pending_ = false;
             hotkey_release_timer_.stop();
-            setTransientStatus(QStringLiteral("按住时间太短"));
+            setTransientStatus(Ui::tr("按住时间太短"));
             return;
         }
         hotkey_pending_ = false;
@@ -3306,7 +3730,7 @@ private:
             hotkey_pending_ = false;
             hotkey_hold_timer_.stop();
             hotkey_release_timer_.stop();
-            setTransientStatus(QStringLiteral("按住时间太短"));
+            setTransientStatus(Ui::tr("按住时间太短"));
             QTimer::singleShot(800, this, [this] { hidePopup(); });
             return;
         }
@@ -3319,15 +3743,15 @@ private:
         hotkey_release_timer_.stop();
     }
 
-    bool injectIntoTarget(WindowsTextInputTarget target, const QString& text, bool* paste_safe) {
+    bool injectIntoTarget(TextInputTarget target, const QString& text, bool* paste_safe) {
         *paste_safe = false;
         if (!usableInjectionTarget(target) || text.trimmed().isEmpty()) return false;
         try {
             const std::wstring wide_text = text.toStdWString();
-            return inject_text_into_windows_text_input(
+            return inject_text_into_text_input(
                 std::move(target),
                 wide_text,
-                GetCurrentProcessId(),
+                current_process_id(),
                 paste_safe);
         } catch (...) {
             // A dead target or a failing COM provider must degrade to the
@@ -3337,33 +3761,163 @@ private:
     }
 #endif
 
+    [[nodiscard]] QString spokenLanguage() const {
+        return QString::fromStdString(translation_settings_.direction.source);
+    }
+
+    [[nodiscard]] QString outputLanguage() const {
+        return QString::fromStdString(translation_settings_.direction.target);
+    }
+
+    // The user's pick when it is installed and fits the language, else the
+    // best installed one (Neural Engine before GPU before CPU), else nothing.
+    [[nodiscard]] std::vector<const CatalogModel*> installedModels(
+        ModelKind kind, const QString& language, const QString& choice) const {
+        std::vector<const CatalogModel*> result;
+        const auto candidates = models_for(kind, kind == ModelKind::Translator ? "" : language.toStdString());
+        if (const CatalogModel* chosen = find_model(choice.toStdString());
+            chosen != nullptr && std::find(candidates.begin(), candidates.end(), chosen) != candidates.end() &&
+            model_manager_->installed(*chosen)) {
+            result.push_back(chosen);
+        }
+        for (const CatalogModel* model : candidates) {
+            if (model_manager_->installed(*model) &&
+                std::find(result.begin(), result.end(), model) == result.end()) {
+                result.push_back(model);
+            }
+        }
+        return result;
+    }
+
+    [[nodiscard]] const CatalogModel* chosenModel(
+        ModelKind kind, const QString& language, const QString& choice) const {
+        const auto models = installedModels(kind, language, choice);
+        return models.empty() ? nullptr : models.front();
+    }
+
+    [[nodiscard]] QString recognizerKey() const {
+        const auto models = installedModels(ModelKind::Recognizer, spokenLanguage(),
+            model_choices_.recognizer.value(spokenLanguage(), QStringLiteral("auto")));
+        return models.empty() ? QString() : QString::fromStdString(models.front()->id) + QLatin1Char(':') + spokenLanguage();
+    }
+
+    // Re-resolves every model after a language, choice or download change.
+    void applyModelChoices() {
+        saveModelChoices();
+        if ((state_ == State::Ready || state_ == State::Error) && recognizerKey() != loaded_recognizer_ &&
+            !recognizerKey().isEmpty()) {
+            state_ = State::Loading;
+            setBubbleStatus(Ui::tr("正在加载..."));
+            recording_control_->setEnabled(false);
+            if (loader_.joinable()) loader_.join();
+            beginLoadModels();
+        }
+        updateTranslatorModel();
+        applySpeechSettings();
+    }
+
+    void updateTranslatorModel() {
+#ifdef SENSEVOICE_WITH_LLM_TRANSLATION
+        const CatalogModel* model = chosenModel(ModelKind::Translator, {}, model_choices_.translator);
+        const QString id = model == nullptr ? QString() : QString::fromStdString(model->id);
+        if (id == translator_model_id_) return;
+        translator_model_id_ = id;
+        {
+            std::lock_guard lock(translator_mutex_);
+            translator_path_ = model == nullptr
+                ? std::filesystem::path()
+                : std::filesystem::path(model_manager_->locate(*model).toStdWString());
+        }
+        translation_ready_direction_.reset();
+        if (translation_worker_) translation_worker_->unload();
+        if (translation_settings_.enabled && state_ == State::Ready) requestTranslationModel();
+#endif
+    }
+
     void beginLoadModels() {
-        loader_ = std::thread([this] {
+        // Resolve on the UI thread; load on the loader thread.
+        struct Candidate {
+            ModelEngine engine;
+            std::filesystem::path path;
+            QString key;
+        };
+        std::vector<Candidate> candidates;
+        const QString language = spokenLanguage();
+        for (const CatalogModel* model : installedModels(ModelKind::Recognizer, language,
+                 model_choices_.recognizer.value(language, QStringLiteral("auto")))) {
+            const QString path = model->engine == ModelEngine::SenseVoiceCoreML
+                ? model_manager_->locateDirectory(*model)
+                : model_manager_->locate(*model);
+            candidates.push_back({model->engine, std::filesystem::path(path.toStdWString()),
+                                  QString::fromStdString(model->id) + QLatin1Char(':') + language});
+        }
+        const std::string whisper_language = language.toStdString();
+        const bool load_base = !base_models_loaded_;
+        loader_ = std::thread([this, candidates, whisper_language, load_base] {
             const std::filesystem::path directory =
-                QCoreApplication::applicationDirPath().toStdWString();
+                dataDirectory().toStdWString();
             std::string error;
-            bool success = engine_.load(directory / L"models" / L"sensevoice-small-q8.gguf", 8, error) &&
-                vad_.load(directory / L"models" / L"fsmn-vad.gguf", 8, error);
-            if (success && std::filesystem::exists(directory / L"hotwords.tsv")) {
-                success = text_processor_.load_hotwords(directory / L"hotwords.tsv", error);
+            bool success = false;
+            QString loaded_key;
+            for (const Candidate& candidate : candidates) {
+                std::string attempt_error;
+                std::unique_ptr<SpeechEngine> engine;
+                if (candidate.engine == ModelEngine::Whisper) {
+                    auto whisper = std::make_unique<WhisperEngine>();
+                    if (whisper->load(candidate.path, whisper_language, 8, attempt_error)) engine = std::move(whisper);
+                } else {
+                    auto sensevoice = std::make_unique<SenseVoiceEngine>();
+                    if (sensevoice->load(candidate.path, 8, attempt_error)) engine = std::move(sensevoice);
+                }
+                if (engine != nullptr) {
+                    // Hold recognition to the language the user speaks.
+                    engine->set_language(whisper_language);
+                    engine_ = std::move(engine);
+                    loaded_key = candidate.key;
+                    success = true;
+                    break;
+                }
+                error += (error.empty() ? "" : "; ") + attempt_error;
             }
-            if (success && std::filesystem::exists(directory / L"corrections.tsv")) {
-                success = text_processor_.load_correction_rules(directory / L"corrections.tsv", error);
+            if (candidates.empty()) {
+                error = "no speech model for this language; download one in Settings > Models";
             }
-            if (success && std::filesystem::exists(directory / L"dict")) {
-                success = text_processor_.initialize_segmenter(directory / L"dict", error);
+            if (success) error.clear();
+            if (success && load_base) {
+                success = vad_.load(directory / L"models" / L"fsmn-vad.gguf", 8, error);
+                const std::filesystem::path hotwords = hotwordsPath(false);
+                if (success && std::filesystem::exists(hotwords)) {
+                    success = text_processor_.load_hotwords(hotwords, error);
+                }
+                if (success && std::filesystem::exists(directory / L"corrections.tsv")) {
+                    success = text_processor_.load_correction_rules(directory / L"corrections.tsv", error);
+                }
+                if (success && std::filesystem::exists(directory / L"dict")) {
+                    success = text_processor_.initialize_segmenter(directory / L"dict", error);
+                }
             }
             if (shutting_down_.load(std::memory_order_acquire)) return;
-            QMetaObject::invokeMethod(this, [this, success, error] {
+            QMetaObject::invokeMethod(this, [this, success, error, loaded_key, load_base] {
                 if (success) {
+                    if (load_base) base_models_loaded_ = true;
+                    loaded_recognizer_ = loaded_key;
                     state_ = State::Ready;
+                    if (tray_icon_ != nullptr) {
+                        tray_icon_->setToolTip(QStringLiteral("SenseVoice 语音输入\n") +
+                            Ui::tr("语音识别：%1").arg(QString::fromLatin1(engine_->device())));
+                    }
                     setBubbleStatus(idleHint());
                     recording_control_->setEnabled(true);
+                    updateTranslatorModel();
                     if (translation_settings_.enabled) requestTranslationModel();
                 } else {
                     state_ = State::Error;
-                    setBubbleStatus(QStringLiteral("模型加载失败"));
+                    loaded_recognizer_.clear();
+                    setBubbleStatus(Ui::tr("模型加载失败"));
                     recording_control_->setToolTip(to_qstring(error));
+                    // A missing model is fixed by downloading it; let the user
+                    // reach Settings without restarting.
+                    if (!load_base || base_models_loaded_) state_ = State::Ready;
                 }
             }, Qt::QueuedConnection);
         });
@@ -3371,6 +3925,10 @@ private:
 
     void startSession(bool via_hotkey) {
         if (state_ != State::Ready) return;
+        if (engine_ == nullptr) {
+            setTransientStatus(Ui::tr("没有这种语言的识别模型，请在设置 › 模型中下载"));
+            return;
+        }
         if (stopper_.joinable()) stopper_.join();
         ++session_generation_;
         status_reset_timer_.stop();
@@ -3379,12 +3937,14 @@ private:
         stop_should_commit_ = false;
         translation_tickets_.clear();
         awaiting_translation_ = false;
+        live_speaking_ = speech_settings_.live && speechActive() && voice_model_ != nullptr;
+        live_next_sentence_ = 0;
         if (translation_settings_.enabled) {
             translation_session_.emplace(translation_settings_.direction);
         } else {
             translation_session_.reset();
         }
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
         if (!via_hotkey) {
             selectInjectionTarget();
         }
@@ -3394,13 +3954,16 @@ private:
 #endif
 
         recognizer_ = std::make_unique<StreamRecognizer>(
-            engine_,
+            *engine_,
             &vad_,
             StreamRecognizerConfig{
                 .partial_interval_ms = 450,
                 .minimum_audio_ms = 600,
                 .minimum_new_audio_ms = 240,
-                .endpoint_silence_ms = vad_settings_.endpoint_ms,
+                // Live speaking needs sentences to close sooner; the translator
+                // gets the earlier sentences as context, so splits cost little.
+                .endpoint_silence_ms = live_speaking_ ? std::min(vad_settings_.endpoint_ms, 800)
+                                                      : vad_settings_.endpoint_ms,
                 .maximum_utterance_ms = 15'000,
                 .memory_limit_mb = 300,
                 .vad_speech_threshold = vad_settings_.threshold_percent / 100.0F,
@@ -3414,8 +3977,8 @@ private:
             },
             &text_processor_);
         std::string playback_mute_error;
-        if (!playback_mute_.mute(playback_mute_error)) {
-            recording_control_->setToolTip(QStringLiteral("无法暂时静音系统播放：%1")
+        if (mute_while_recording_ && !playback_mute_.mute(playback_mute_error)) {
+            recording_control_->setToolTip(Ui::tr("无法暂时静音系统播放：%1")
                                                .arg(to_qstring(playback_mute_error)));
         }
         microphone_ = std::make_unique<MicrophoneCapture>();
@@ -3435,21 +3998,70 @@ private:
             recording_control_->setListening(false);
             recording_control_->setEnabled(true);
             recording_control_->setToolTip(to_qstring(error));
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
             hotkey_recording_ = false;
             hotkey_release_timer_.stop();
 #endif
-            setTransientStatus(QStringLiteral("麦克风不可用"));
+            setTransientStatus(Ui::tr("麦克风不可用"));
             return;
         }
 
         state_ = State::Listening;
+        armCancelKey(true);
         session_elapsed_.start();
         setBubbleStatus(listeningHint());
         beginStableSessionGeometry();
         recording_control_->setListening(true);
         recording_control_->setEnabled(true);
         updateTranslationUi();
+    }
+
+    // Esc during a take: nothing is typed, copied or spoken, and speech that
+    // live mode already queued is dropped.
+    void cancelTake() {
+        live_speaking_ = false;
+        if (speech_queue_ != nullptr) speech_queue_->clear();
+        if (state_ == State::Listening) {
+            stopSession(false);
+        } else if (state_ == State::Stopping) {
+            stop_should_commit_ = false;
+#ifdef SENSEVOICE_NATIVE_INPUT
+            inject_on_complete_ = false;
+#endif
+            if (awaiting_translation_) {
+                awaiting_translation_ = false;
+                translation_deadline_.stop();
+                translation_session_.reset();
+                translation_tickets_.clear();
+                finishSession(false, {}, {}, {}, {});
+            } else {
+                setBubbleStatus(Ui::tr("正在取消..."));
+            }
+        }
+    }
+
+    // Esc is only claimed system-wide while a take is in progress.
+    void armCancelKey(bool armed) {
+        if (preview_mode_) return;
+#if defined(__APPLE__)
+        if (armed) {
+            mac_cancel_hotkey_.set_shortcut(QKeySequence(Qt::Key_Escape), [this] {
+                QMetaObject::invokeMethod(this, [this] { cancelTake(); }, Qt::QueuedConnection);
+            });
+        } else {
+            mac_cancel_hotkey_.clear();
+        }
+#elif defined(_WIN32)
+        const HWND handle = reinterpret_cast<HWND>(winId());
+        if (armed && !cancel_key_registered_) {
+            cancel_key_registered_ = RegisterHotKey(handle, hotkey_cancel_id, MOD_NOREPEAT, VK_ESCAPE) != FALSE;
+        } else if (!armed && cancel_key_registered_) {
+            UnregisterHotKey(handle, hotkey_cancel_id);
+            cancel_key_registered_ = false;
+        }
+#else
+        (void)armed;
+#endif
     }
 
     void stopSession(bool commit) {
@@ -3459,11 +4071,11 @@ private:
         if (!commit) inject_on_complete_ = false;
         toggle_active_ = false;
         toggle_limit_timer_.stop();
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
         hotkey_recording_ = false;
         hotkey_release_timer_.stop();
 #endif
-        setBubbleStatus(commit ? QStringLiteral("正在完成...") : QStringLiteral("正在取消..."));
+        setBubbleStatus(commit ? Ui::tr("正在完成...") : Ui::tr("正在取消..."));
         recording_control_->setStopping(true);
 
         if (stopper_.joinable()) stopper_.join();
@@ -3479,7 +4091,8 @@ private:
     void stopWorkerFinished(bool commit) {
         if (stopper_.joinable()) stopper_.join();
         playback_mute_.restore();
-        QTimer::singleShot(0, this, [this, commit] { sessionStopped(commit); });
+        // Esc may have cancelled a take that was released to be committed.
+        QTimer::singleShot(0, this, [this, commit] { sessionStopped(commit && stop_should_commit_); });
     }
 
     void sessionStopped(bool commit) {
@@ -3518,14 +4131,16 @@ private:
         if (!wants_translation) {
             notice.clear();
         } else if (translation.isEmpty() && notice.isEmpty()) {
-            notice = QStringLiteral("未开启翻译，已输入原文");
+            notice = Ui::tr("未开启翻译，已输入原文");
         }
-        if (copy_only) notice.replace(QStringLiteral("已输入"), QStringLiteral("已复制"));
+        if (copy_only) notice.replace(Ui::tr("已输入"), Ui::tr("已复制"));
         // 朗读 never falls back to the 原文: no 译文, nothing is spoken.
-        if (commit && !final_text.isEmpty() && speechActive()) {
+        if (live_speaking_ && commit) {
+            // Live mode already spoke each sentence as it was translated.
+        } else if (commit && !final_text.isEmpty() && speechActive()) {
             if (translation.isEmpty()) {
-                notice = notice.isEmpty() ? QStringLiteral("没有译文，未朗读")
-                                          : notice + QStringLiteral("，未朗读");
+                notice = notice.isEmpty() ? Ui::tr("没有译文，未朗读")
+                                          : notice + Ui::tr("，未朗读");
             } else {
                 speak(translation);
             }
@@ -3539,38 +4154,38 @@ private:
             recordHistory(clipboard_text);
             std::string hotword_error;
             const std::filesystem::path hotword_path =
-                std::filesystem::path(QCoreApplication::applicationDirPath().toStdWString()) /
-                L"hotwords.tsv";
+                hotwordsPath(true);
             if (!text_processor_.save_hotwords(hotword_path, hotword_error)) {
                 recording_control_->setToolTip(to_qstring(hotword_error));
             }
         }
 
         state_ = State::Ready;
+        armCancelKey(false);
         stop_should_commit_ = false;
         recording_control_->setListening(false);
         recording_control_->setEnabled(true);
         updateTranslationUi();
         if (!commit) {
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
             target_ = {};
             inject_on_complete_ = false;
 #endif
-            setTransientStatus(QStringLiteral("已取消"));
+            setTransientStatus(Ui::tr("已取消"));
             QTimer::singleShot(500, this, [this] { hidePopup(); });
         } else if (output_text.isEmpty()) {
-#ifdef _WIN32
+#ifdef SENSEVOICE_NATIVE_INPUT
             target_ = {};
             inject_on_complete_ = false;
 #endif
-            setTransientStatus(QStringLiteral("未识别到"));
+            setTransientStatus(Ui::tr("未识别到"));
             QTimer::singleShot(500, this, [this] { hidePopup(); });
         } else {
-#ifdef _WIN32
-            WindowsTextInputTarget target = std::move(target_);
+#ifdef SENSEVOICE_NATIVE_INPUT
+            TextInputTarget target = std::move(target_);
             if (copy_only) {
                 inject_on_complete_ = false;
-                const QString copy_status = QStringLiteral("已复制到剪贴板");
+                const QString copy_status = Ui::tr("已复制到剪贴板");
                 transcript_->setBubbleContent(
                     output_text,
                     notice.isEmpty() ? copy_status : notice,
@@ -3591,7 +4206,7 @@ private:
                     return;
                 }
                 if (!should_inject) {
-                    recording_control_->setToolTip(QStringLiteral("没有输入目标，已复制到剪贴板"));
+                    recording_control_->setToolTip(Ui::tr("没有输入目标，已复制到剪贴板"));
                     if (notice.isEmpty()) scheduleLingerHide(session_id);
                     else showTranslationNotice(text_to_inject, notice);
                     return;
@@ -3614,7 +4229,7 @@ private:
 #else
             (void)notice;
             refreshTranscript();
-            recording_control_->setToolTip(QStringLiteral("已复制到剪贴板"));
+            recording_control_->setToolTip(Ui::tr("已复制到剪贴板"));
             scheduleLingerHide(session_id);
 #endif
         }
@@ -3623,7 +4238,7 @@ private:
     void handleRecognition(const RecognitionEvent& event) {
         if (state_ == State::Stopping && !stop_should_commit_) return;
         if (event.kind == RecognitionEventKind::Error) {
-            setTransientStatus(QStringLiteral("识别失败"));
+            setTransientStatus(Ui::tr("识别失败"));
             return;
         }
         const QString value = to_qstring(event.text).trimmed();
@@ -3647,9 +4262,27 @@ private:
 
     void createTranslationWorker() {
         const std::filesystem::path models =
-            std::filesystem::path(QCoreApplication::applicationDirPath().toStdWString()) / L"models";
+            std::filesystem::path(dataDirectory().toStdWString()) / L"models";
+        (void)models;
         translation_worker_ = std::make_unique<TranslationWorker>(
-            make_opus_mt_factory(models, 4),
+#ifdef SENSEVOICE_WITH_LLM_TRANSLATION
+            // The model file is whichever translator the user picked; it is
+            // read when a direction loads, on the worker thread.
+            [this](TranslationDirection direction, std::string& error) -> std::unique_ptr<Translator> {
+                std::filesystem::path path;
+                {
+                    std::lock_guard lock(translator_mutex_);
+                    path = translator_path_;
+                }
+                if (path.empty()) {
+                    error = "no translation model installed; download one in Settings > Models";
+                    return nullptr;
+                }
+                return make_llm_translation_factory(path, 4)(direction, error);
+            },
+#else
+            make_default_translation_factory(models, 4),
+#endif
             [this](TranslationDirection direction, bool ok, const std::string& error) {
                 if (shutting_down_.load(std::memory_order_acquire)) return;
                 QMetaObject::invokeMethod(this, [this, direction, ok, error] {
@@ -3686,7 +4319,7 @@ private:
             }
         }
         updateTranslationUi();
-        applySpeechSettings();
+        applyModelChoices();
     }
 
     void setTranslationEnabled(bool enabled) {
@@ -3724,12 +4357,12 @@ private:
             applySpeechSettings();
             if (tray_icon_ != nullptr) {
                 tray_icon_->showMessage(
-                    QStringLiteral("翻译模型加载失败"),
-                    QStringLiteral("已关闭翻译模式。%1").arg(to_qstring(error)),
+                    Ui::tr("翻译模型加载失败"),
+                    Ui::tr("已关闭翻译模式。%1").arg(to_qstring(error)),
                     QSystemTrayIcon::Warning, 6000);
             }
             if (isVisible() && state_ == State::Ready) {
-                setTransientStatus(QStringLiteral("翻译模型加载失败，已关闭翻译模式"));
+                setTransientStatus(Ui::tr("翻译模型加载失败，已关闭翻译模式"));
             }
         }
         updateTranslationUi();
@@ -3742,8 +4375,20 @@ private:
             translation_loading_, locked);
         if (tray_translation_action_ != nullptr) {
             tray_translation_action_->setChecked(translation_settings_.enabled);
-            tray_zh_en_action_->setChecked(translation_settings_.direction == TranslationDirection::ZhToEn);
-            tray_en_zh_action_->setChecked(translation_settings_.direction == TranslationDirection::EnToZh);
+            if (tray_speech_action_ != nullptr) tray_speech_action_->setChecked(speech_settings_.enabled);
+            const auto label = [](const TranslationDirection& direction) {
+                const auto name = [](const std::string& code) {
+                    const LanguageInfo* language = find_language(code);
+                    return language == nullptr ? QString::fromStdString(code)
+                        : QString::fromUtf8(language->native_name.data(),
+                                            static_cast<qsizetype>(language->native_name.size()));
+                };
+                return name(direction.source) + QStringLiteral(" → ") + name(direction.target);
+            };
+            tray_zh_en_action_->setText(label(translation_settings_.direction));
+            tray_en_zh_action_->setText(label(translation_settings_.direction.reversed()));
+            tray_zh_en_action_->setChecked(true);
+            tray_en_zh_action_->setChecked(false);
             for (QAction* action : {tray_translation_action_, tray_zh_en_action_, tray_en_zh_action_}) {
                 action->setEnabled(!locked);
             }
@@ -3752,6 +4397,17 @@ private:
 
     // Organise first, then translate: the clean-mode polish runs per sentence so the
     // text the model sees is exactly the text that gets injected.
+    // Do-not-translate hotwords, and the recording's earlier sentences so a
+    // sentence cut by a pause is translated as part of the same thought.
+    [[nodiscard]] TranslationHints translationHints() const {
+        TranslationHints hints;
+        for (const HotwordEntry& entry : text_processor_.hotwords()) {
+            if (entry.enabled && entry.keep_untranslated) hints.keep_terms.push_back(entry.phrase);
+        }
+        if (translation_session_.has_value()) hints.previous = translation_session_->translated_pairs();
+        return hints;
+    }
+
     void submitForTranslation(const QString& sentence) {
         const QString organised = text_mode_ == TextMode::Clean ? polished(sentence) : sentence;
         committed_text_ += organised;
@@ -3764,7 +4420,22 @@ private:
         }
         const std::uint64_t ticket = ++next_translation_ticket_;
         translation_tickets_[ticket] = PendingTranslation{session_generation_, *index};
-        translation_worker_->translate(ticket, utf8);
+        translation_worker_->translate(ticket, utf8, translationHints());
+    }
+
+    // Live speaking: say each sentence as soon as it and every sentence before
+    // it are settled, while the user keeps talking. Esc still discards what
+    // hasn't been played yet.
+    void speakLiveSentences() {
+        if (!live_speaking_ || !translation_session_.has_value()) return;
+        while (live_next_sentence_ < translation_session_->size()) {
+            const SentenceTranslationState state = translation_session_->state(live_next_sentence_);
+            if (state == SentenceTranslationState::Pending) break;
+            if (state == SentenceTranslationState::Translated) {
+                speak(to_qstring(translation_session_->translation(live_next_sentence_)));
+            }
+            ++live_next_sentence_;
+        }
     }
 
     void translationFinished(std::uint64_t ticket, const std::optional<std::string>& translation) {
@@ -3775,6 +4446,7 @@ private:
         if (!translation_session_.has_value() || pending.session != session_generation_) return;
         if (translation.has_value()) translation_session_->set_translation(pending.index, *translation);
         else translation_session_->set_failed(pending.index);
+        speakLiveSentences();
 
         if (awaiting_translation_) {
             if (!translation_session_->has_pending()) completeTranslation(false);
@@ -3793,7 +4465,7 @@ private:
         }
         transcript_->setBubbleContent(
             to_qstring(translation_session_->original_text()),
-            QStringLiteral("翻译中..."),
+            Ui::tr("翻译中..."),
             TranscriptBubble::SecondaryTone::Pending);
         updateWindowGeometry();
         translation_deadline_.start(translation_timeout_ms);
@@ -3817,13 +4489,13 @@ private:
         case FallbackReason::None:
             break;
         case FallbackReason::LanguageMismatch:
-            notice = QStringLiteral("语种与方向不符，已输入原文");
+            notice = Ui::tr("语种与方向不符，已输入原文");
             break;
         case FallbackReason::TranslationFailed:
-            notice = QStringLiteral("翻译失败，已输入原文");
+            notice = Ui::tr("翻译失败，已输入原文");
             break;
         case FallbackReason::Timeout:
-            notice = QStringLiteral("翻译超时，已输入原文");
+            notice = Ui::tr("翻译超时，已输入原文");
             break;
         }
         translation_session_.reset();
@@ -3834,8 +4506,14 @@ private:
     void createSpeechQueue() {
         const QString app_directory = QCoreApplication::applicationDirPath();
         speech_queue_ = new SpeechQueue(
-            QDir(app_directory).filePath(QStringLiteral("sensevoice-tts.exe")),
-            QDir(app_directory).filePath(QStringLiteral("models/kokoro-multi-lang-v1_1")),
+            QDir(app_directory).filePath(
+#ifdef _WIN32
+                QStringLiteral("sensevoice-tts.exe")
+#else
+                QStringLiteral("sensevoice-tts")
+#endif
+                ),
+            QDir(dataDirectory()).filePath(QStringLiteral("models/kokoro-multi-lang-v1_1")),
             [this](const QString& message) {
                 if (shutting_down_.load(std::memory_order_acquire)) return;
                 showSpeechNotice(message);
@@ -3844,8 +4522,8 @@ private:
                 if (shutting_down_.load(std::memory_order_acquire)) return;
                 if (state != SpeechQueue::State::Failed) return;
                 if (tray_icon_ != nullptr) {
-                    tray_icon_->showMessage(QStringLiteral("朗读不可用"),
-                                            QStringLiteral("朗读模型加载失败。%1").arg(error),
+                    tray_icon_->showMessage(Ui::tr("朗读不可用"),
+                                            Ui::tr("朗读模型加载失败。%1").arg(error),
                                             QSystemTrayIcon::Warning, 6000);
                 }
             },
@@ -3861,7 +4539,14 @@ private:
     void applySpeechSettings() {
         if (speech_queue_ == nullptr) return;
         speech_queue_->setOutput(speech_settings_.device_id, speech_settings_.monitor);
-        const bool active = speechActive();
+        // Kokoro for English and Chinese, a Piper voice for other languages.
+        voice_model_ = chosenModel(ModelKind::Voice, outputLanguage(),
+                                   model_choices_.voice.value(outputLanguage(), QStringLiteral("auto")));
+        if (voice_model_ != nullptr) {
+            speech_queue_->setModel(model_manager_->locateDirectory(*voice_model_),
+                                    voice_model_->engine == ModelEngine::Piper ? QString() : outputLanguage());
+        }
+        const bool active = speechActive() && voice_model_ != nullptr;
         if (!active || speech_queue_->state() != SpeechQueue::State::Failed) {
             speech_queue_->setActive(active);
         } else {
@@ -3872,21 +4557,28 @@ private:
     }
 
     void speak(const QString& translation) {
-        // The 译文 is in the target language of the 翻译方向.
-        const int voice = translation_settings_.direction == TranslationDirection::ZhToEn
-            ? speech_settings_.voice_en
-            : speech_settings_.voice_zh;
+        if (voice_model_ == nullptr) {
+            showSpeechNotice(Ui::tr("没有 %1 的朗读声音，请在设置 › 模型中下载")
+                                 .arg(QString::fromStdString(translation_settings_.direction.target)));
+            return;
+        }
+        // The 译文 is in the target language; Kokoro picks the speaker by it,
+        // Piper voices have a single speaker.
+        int voice = 0;
+        if (voice_model_->engine == ModelEngine::Kokoro) {
+            voice = outputLanguage() == QStringLiteral("zh") ? speech_settings_.voice_zh : speech_settings_.voice_en;
+        }
         speech_queue_->speak(translation, voice, speech_settings_.speed_percent / 100.0);
     }
 
     void showSpeechNotice(const QString& message) {
         if (state_ != State::Ready) {
             if (tray_icon_ != nullptr) {
-                tray_icon_->showMessage(QStringLiteral("朗读"), message, QSystemTrayIcon::Warning, 3000);
+                tray_icon_->showMessage(Ui::tr("朗读"), message, QSystemTrayIcon::Warning, 3000);
             }
             return;
         }
-        showTranslationNotice(QStringLiteral("朗读"), message);
+        showTranslationNotice(Ui::tr("朗读"), message);
     }
 
     void showTranslationNotice(const QString& text, const QString& notice) {
@@ -4038,15 +4730,15 @@ private:
         }
 
         if (state_ != State::Listening && state_ != State::Stopping) return;
-        QString activity = QStringLiteral("静音");
-        if (vad.activity == VadActivity::Candidate) activity = QStringLiteral("准备");
-        else if (vad.activity == VadActivity::Speech) activity = QStringLiteral("语音");
-        else if (vad.activity == VadActivity::EndpointWait) activity = QStringLiteral("等待句尾");
+        QString activity = Ui::tr("静音");
+        if (vad.activity == VadActivity::Candidate) activity = Ui::tr("准备");
+        else if (vad.activity == VadActivity::Speech) activity = Ui::tr("语音");
+        else if (vad.activity == VadActivity::EndpointWait) activity = Ui::tr("等待句尾");
         if (audio.clipped_percent >= 0.1F) {
-            recording_control_->setToolTip(QStringLiteral("输入削波 %1% · 请降低系统麦克风音量")
+            recording_control_->setToolTip(Ui::tr("输入削波 %1% · 请降低系统麦克风音量")
                                                .arg(audio.clipped_percent, 0, 'f', 1));
         } else {
-            recording_control_->setToolTip(QStringLiteral("输入 %1 dBFS · VAD %2 · 门限 %3 dBFS")
+            recording_control_->setToolTip(Ui::tr("输入 %1 dBFS · VAD %2 · 门限 %3 dBFS")
                                                .arg(audio.input_rms_db, 0, 'f', 1)
                                                .arg(activity)
                                                .arg(vad.required_db, 0, 'f', 1));
@@ -4065,9 +4757,7 @@ private:
     int paste_delay_ms_ = default_paste_delay_ms;
     VadSettings vad_settings_;
     TextMode text_mode_ = TextMode::Clean;
-#ifdef _WIN32
     bool startup_enabled_ = false;
-#endif
     QString hotkey_shortcut_ = QString::fromLatin1(default_hotkey);
     BubbleStyle bubble_style_ = BubbleStyle::Ring;
     bool preview_mode_ = false;
@@ -4078,26 +4768,46 @@ private:
     QTimer meter_timer_;
     QTimer status_reset_timer_;
     QElapsedTimer session_elapsed_;
+#ifdef SENSEVOICE_NATIVE_INPUT
+    QTimer hotkey_hold_timer_;
+    QTimer hotkey_release_timer_;
+    TextInputTarget target_;
+    TextInputTarget last_target_;
+    bool hotkey_pending_ = false;
+    bool hotkey_recording_ = false;
+#endif
+#ifdef __APPLE__
+    MacGlobalHotkey mac_hotkey_;
+    MacGlobalHotkey mac_cancel_hotkey_;
+#endif
 #ifdef _WIN32
     static constexpr int hotkey_primary_id = 0x5340;
     static constexpr int hotkey_left_id = 0x5341;
     static constexpr int hotkey_right_id = 0x5342;
+    static constexpr int hotkey_cancel_id = 0x5343;
+    bool cancel_key_registered_ = false;
     static constexpr UINT hotkey_state_message = WM_APP + 0x341;
     inline static HHOOK keyboard_hook_ = nullptr;
     inline static HWND hotkey_message_window_ = nullptr;
-    QTimer hotkey_hold_timer_;
-    QTimer hotkey_release_timer_;
     HotkeyBinding hotkey_binding_;
-    WindowsTextInputTarget target_;
-    WindowsTextInputTarget last_target_;
     bool hotkey_primary_registered_ = false;
     bool hotkey_left_registered_ = false;
     bool hotkey_right_registered_ = false;
-    bool hotkey_pending_ = false;
-    bool hotkey_recording_ = false;
 #endif
 
-    SenseVoiceEngine engine_;
+    // SenseVoice or Whisper, whichever fits the spoken language.
+    std::unique_ptr<SpeechEngine> engine_;
+    QString loaded_recognizer_;  // "<model id>:<language>"
+    bool base_models_loaded_ = false;
+    ModelManager* model_manager_ = nullptr;
+    ModelChoices model_choices_;
+    QString translator_model_id_;
+    const CatalogModel* voice_model_ = nullptr;
+    // Set per session from SpeechSettings::live when speech is usable.
+    bool live_speaking_ = false;
+    std::size_t live_next_sentence_ = 0;
+    std::mutex translator_mutex_;
+    std::filesystem::path translator_path_;
     FsmnVadEngine vad_;
     TextProcessor text_processor_;
     SystemAudioMute playback_mute_;
@@ -4136,6 +4846,8 @@ private:
     bool awaiting_translation_ = false;
     QTimer translation_deadline_;
     QAction* tray_translation_action_ = nullptr;
+    QAction* tray_speech_action_ = nullptr;
+    bool mute_while_recording_ = true;
     QAction* tray_zh_en_action_ = nullptr;
     QAction* tray_en_zh_action_ = nullptr;
 };
@@ -4147,6 +4859,7 @@ int main(int argc, char* argv[]) {
     application.setApplicationName(QStringLiteral("SenseVoice 语音输入"));
     application.setOrganizationName(QStringLiteral("SenseVoice"));
     application.setWindowIcon(sensevoiceIcon());
+    installUiTranslator(application);
 
     const QStringList arguments = application.arguments();
 #ifdef _WIN32
@@ -4171,7 +4884,7 @@ int main(int argc, char* argv[]) {
     QString preview_settings_dir;
     QString preview_geometry_log_path;
     QString preview_translation;
-    QString preview_text = QStringLiteral(
+    QString preview_text = Ui::tr(
         "这一句用于比较浮窗方案的文字布局。说长一点时，气泡会自动扩展，不滚动，也不会裁切内容。\n"
         "第二段会保留在同一个浮窗中，方便观察长内容的宽高变化。\n"
         "按住 Ctrl + Win 开始录音，松开后会注入到上一次定位的光标位置。");
@@ -4216,6 +4929,9 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+#ifndef __APPLE__
+    // macOS keeps the system font (SF Pro, PingFang for Chinese), native
+    // menus and tooltips, and follows dark mode.
     application.setFont(QFont(QStringLiteral("Microsoft YaHei UI"), 10));
     application.setStyleSheet(QStringLiteral(
         "QToolTip { color: #FFFFFF; background: #30343A; border: none; padding: 5px; }"
@@ -4223,6 +4939,7 @@ int main(int argc, char* argv[]) {
         "QMenu::item { min-width: 130px; padding: 7px 18px; border-radius: 4px; }"
         "QMenu::item:selected { background: #EFF8F5; color: #168E68; }"
         "QMenu::item:disabled { color: #B6BBC1; }"));
+#endif
 
     std::vector<std::unique_ptr<VoiceInputWindow>> preview_windows;
     std::unique_ptr<VoiceInputWindow> single_window;
@@ -4263,7 +4980,9 @@ int main(int argc, char* argv[]) {
                                    HotkeyTrigger::Hold, ResultDestination::Insert, ResultContent::Both,
                                    ResultContent::Original,
                                    default_paste_delay_ms, false, {}, TranslationSettings{},
-                                   SpeechSettings{}, AppearanceSettings{}, BubbleStyle::Panel, {});
+                                   SpeechSettings{}, AppearanceSettings{}, BubbleStyle::Panel, {},
+                                   new ModelManager(QDir(dataDirectory()).filePath(QStringLiteral("models")),
+                                                    &application));
         dialog.show();
         auto* tabs = dialog.findChild<QTabWidget*>();
         for (int tab = 0; tabs != nullptr && tab < tabs->count(); ++tab) {

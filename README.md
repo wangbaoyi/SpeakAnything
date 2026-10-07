@@ -1,6 +1,9 @@
 # SpeakAnything
 
+**中文** | [English](README.en.md)
+
 ![Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)
+![macOS](https://img.shields.io/badge/platform-macOS%20(preview)-000000?logo=apple&logoColor=white)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
 ![Qt 6](https://img.shields.io/badge/UI-Qt%206-41CD52?logo=qt&logoColor=white)
 ![Offline](https://img.shields.io/badge/inference-offline-2E7D32)
@@ -13,6 +16,8 @@
 - 仓库：<https://github.com/wangbaoyi/SpeakAnything>
 - 下载：<https://github.com/wangbaoyi/SpeakAnything/releases>（便携 ZIP，已包含全部模型）
 
+界面语言跟随系统（中文或英文），可在托盘菜单 → **Language / 语言** 中切换，重启后生效。
+
 ---
 
 ## 目录
@@ -20,17 +25,18 @@
 1. [功能概览](#功能概览)
 2. [快速开始](#快速开始)
 3. [朗读给通话对方（虚拟麦克风）](#朗读给通话对方虚拟麦克风)
-4. [模型与下载链接](#模型与下载链接)
-5. [系统架构](#系统架构)
-6. [源码结构](#源码结构)
-7. [设置项](#设置项)
-8. [命令行工具](#命令行工具)
-9. [编译](#编译)
-10. [打包与发布](#打包与发布)
-11. [测试](#测试)
-12. [性能参考](#性能参考)
-13. [设计文档](#设计文档)
-14. [第三方组件与许可证](#第三方组件与许可证)
+4. [macOS（预览）](#macos预览)
+5. [模型与下载链接](#模型与下载链接)
+6. [系统架构](#系统架构)
+7. [源码结构](#源码结构)
+8. [设置项](#设置项)
+9. [命令行工具](#命令行工具)
+10. [编译](#编译)
+11. [打包与发布](#打包与发布)
+12. [测试](#测试)
+13. [性能参考](#性能参考)
+14. [设计文档](#设计文档)
+15. [第三方组件与许可证](#第三方组件与许可证)
 
 ---
 
@@ -79,6 +85,53 @@
 - 朗读设备不可用时提示错误，不会改用其他设备（否则声音会从自己的扬声器外放，对方反而听不到）。
 - 可选 **监听**：同时在自己的默认播放设备上播放；录音期间自动静音，避免被重新录进去。
 - 中→英时用英文声音，英→中时用中文声音。
+
+## macOS（预览）
+
+macOS 版与 Windows 版共用同一个 CMake 工程，仍在移植中。目前已完成：
+
+| 部分 | macOS 实现 |
+| --- | --- |
+| 语音识别 | 启动时自动选最快的（托盘提示中显示）：macOS 15+ 用 Core ML 版本跑在 **神经网络引擎** 上；否则用与 Windows 相同的 Q8 GGUF，经 Metal 跑在 **GPU** 上；都不行才用 CPU |
+| 录音时静音 | macOS 上默认关闭；托盘菜单 →「录音时静音系统声音」 |
+| 句尾静音 | macOS 上为 1200 ms（Windows 700 ms），自然停顿不会把一句话拆开 |
+| VAD | FSMN-VAD 仍在 CPU 上（模型只有 1.7 MB，交给 NPU 的调度开销比计算本身还大） |
+| 翻译 | **Qwen3-1.7B（Q4_K_M）通过 llama.cpp Metal 后端在 GPU 上运行**，一个模型兼顾两个方向 |
+| 语音合成 | Kokoro 经 sherpa-onnx 在 CPU 上运行；实测 ONNX Runtime 的 Core ML 后端反而更慢 |
+| 全局快捷键 | Carbon `RegisterEventHotKey`（不需要"输入监控"权限）；默认 **⌃⌥Space**，因为 ⌘⌥Space 是访达搜索 |
+| 输入到光标 | 辅助功能 API（`kAXSelectedTextAttribute`），失败时用 ⌘V 粘贴兜底 |
+| 录音期间静音 | CoreAudio 默认输出静音 |
+| 朗读播放 | miniaudio（CoreAudio），设备以 CoreAudio UID 标识 |
+| 登录时启动 | `SMAppService`（macOS 13+） |
+| 虚拟麦克风 | 自带 CoreAudio HAL 插件 **SpeakAnything Virtual Mic**，取代 VB-Cable |
+| 应用包 | `SpeakAnything.app`，只显示在菜单栏（`LSUIElement`）；模型放在 `Contents/Resources/models` |
+
+权限：首次启动时 macOS 会请求 **麦克风** 权限，SpeakAnything 还会请求 **辅助功能** 权限（系统设置 → 隐私与安全性 → 辅助功能），用于向其他程序输入文字。未授权时文字仍会复制到剪贴板。
+
+M4（macOS 15.7）实测（热启动）：识别模型加载 0.36 秒（首次启动需编译一次，约 15 秒）；一句 4 到 7 秒的语音 NPU 识别 14 到 33 ms，GPU 57 到 83 ms，CPU 110 到 180 ms；GPU 翻译一句 0.3 到 0.6 秒；Kokoro 合成实时率 0.23 到 0.26。
+
+NPU 识别模型需要 **macOS 15**。打包：`tools/package_macos.sh 0.3.0` 生成包含全部模型和虚拟麦克风的 DMG（约 1.7 GB）。macOS 模型来源与编译方法见 [英文文档](README.en.md#building-on-macos)。尚未完成：公证（需要 Developer ID）、Kokoro 上 NPU。
+
+### macOS 虚拟麦克风
+
+`packaging/macos/virtual-mic` 编译出 `SpeakAnythingMic.driver`，这是一个用户态 AudioServerPlugIn（不是内核扩展）。它提供一个 48 kHz 立体声设备：播放到它输出端的声音会从它的输入端出来。
+
+1. 编译（macOS 构建会一起编译）后安装，需要管理员密码，并会短暂重启 `coreaudiod`：`packaging/macos/install-virtual-mic.sh`
+2. SpeakAnything → 设置 → **朗读**：朗读设备选 **SpeakAnything Virtual Mic**。
+3. 通话软件里把麦克风也选成 **SpeakAnything Virtual Mic**。
+
+卸载：`packaging/macos/install-virtual-mic.sh --uninstall`。该设备不会自动成为系统默认输出。
+
+## 多语言、边说边朗读与取消
+
+- **语言**：设置 → 翻译 → 「我说的语言」「翻译成」可选 28 种语言（含西班牙语、德语、法语、保加利亚语、俄语等）。多语言翻译使用 Qwen3（macOS）；Windows 上的 Opus-MT 仍只支持中英互译。
+- **识别**：SenseVoice 支持中、英、粤、日、韩；其他语言需要在 设置 → **模型** 中下载 Whisper（Small 或 Large v3 Turbo）。macOS 上 Whisper Small 的编码器运行在神经网络引擎上。
+- **声音**：Kokoro 说中英文；其他 21 种语言可下载 Piper 声音（暂无保加利亚语声音）。
+- **模型页**：为当前语言选择识别、翻译和朗读模型，或选「自动」。应用只内置小模型，其余下载到 `~/Library/Application Support/SpeakAnything/models`。
+- **边说边朗读**（设置 → 朗读）：每次停顿后，前面的句子立即翻译并念出，不等松开快捷键；前文作为上下文传给翻译模型。
+- **Esc**：按住快捷键时（或收尾时）按 Esc 放弃本次输入，不输入、不复制、不朗读，并清空朗读队列。
+- **笑声**：SenseVoice 识别为事件的笑声会保留为「哈哈 / haha」，翻译时也保留，朗读能念出来。
+- **不翻译**：在热词表中勾选「不翻译」即可原样保留，例如「Claude Code」，别名填 `cloud code` 还能纠正识别。
 
 ## 模型与下载链接
 

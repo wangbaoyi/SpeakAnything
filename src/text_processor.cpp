@@ -76,6 +76,40 @@ bool is_utf8_lead(unsigned char value) {
     return value >= 0xC0U;
 }
 
+// Code point starting at position (or ending just before end, for decode_before).
+char32_t decode_at(std::string_view text, std::size_t position) {
+    const auto lead = static_cast<unsigned char>(text[position]);
+    int length = lead >= 0xF0U ? 4 : lead >= 0xE0U ? 3 : lead >= 0xC0U ? 2 : 1;
+    if (position + static_cast<std::size_t>(length) > text.size()) return lead;
+    char32_t value = length == 1 ? lead : lead & (0x7FU >> length);
+    for (int index = 1; index < length; ++index) {
+        value = (value << 6U) | (static_cast<unsigned char>(text[position + index]) & 0x3FU);
+    }
+    return value;
+}
+
+char32_t decode_before(std::string_view text, std::size_t end) {
+    if (end == 0) return 0;
+    std::size_t start = end - 1;
+    while (start > 0 && (static_cast<unsigned char>(text[start]) & 0xC0U) == 0x80U) --start;
+    return decode_at(text, start);
+}
+
+// Han, kana, Hangul and full-width forms: text that takes Chinese-style
+// punctuation and no spaces between words.
+bool is_cjk_code_point(char32_t c) {
+    return (c >= 0x2E80 && c <= 0x9FFF) || (c >= 0xAC00 && c <= 0xD7AF) ||
+        (c >= 0xF900 && c <= 0xFAFF) || (c >= 0xFF00 && c <= 0xFFEF) ||
+        (c >= 0x20000 && c <= 0x2FA1F);
+}
+
+// Letters and digits of space-separated scripts: Latin (with accents),
+// Cyrillic, Greek, Arabic, Devanagari and so on.
+bool is_spaced_word_code_point(char32_t c) {
+    if (c < 0x80) return std::isalnum(static_cast<int>(c)) != 0;
+    return c >= 0xC0 && !is_cjk_code_point(c) && !(c >= 0x2000 && c <= 0x2BFF);
+}
+
 std::string normalize_dictation_punctuation(std::string_view text) {
     std::string output;
     output.reserve(text.size() + 4);
@@ -87,10 +121,10 @@ std::string normalize_dictation_punctuation(std::string_view text) {
             position = next;
             continue;
         }
-        const bool previous_is_chinese = !output.empty() &&
-            (static_cast<unsigned char>(output.back()) & 0xC0U) == 0x80U;
+        const bool previous_is_chinese = is_cjk_code_point(decode_before(output, output.size()));
         const bool next_is_chinese = position + 1 < text.size() &&
-            is_utf8_lead(static_cast<unsigned char>(text[position + 1]));
+            is_utf8_lead(static_cast<unsigned char>(text[position + 1])) &&
+            is_cjk_code_point(decode_at(text, position + 1));
         const bool chinese_context = previous_is_chinese || next_is_chinese;
         const bool decimal_point = value == '.' && position > 0 && position + 1 < text.size() &&
             std::isdigit(static_cast<unsigned char>(text[position - 1])) != 0 &&
@@ -585,6 +619,9 @@ bool TextProcessor::load_hotwords(const std::filesystem::path& path, std::string
                 entry.boost = 3.0F;
             }
         }
+        if (fields.size() > 5) {
+            entry.keep_untranslated = parse_bool(fields[5]);
+        }
         entries.push_back(std::move(entry));
     }
     if (!input.good() && !input.eof()) {
@@ -601,7 +638,7 @@ bool TextProcessor::save_hotwords(const std::filesystem::path& path, std::string
         error = "failed to open hotwords file for writing: " + path.string();
         return false;
     }
-    output << "# phrase\taliases separated by |\tenabled\thits\tctc boost (0-12)\n";
+    output << "# phrase\taliases separated by |\tenabled\thits\tctc boost (0-12)\tkeep untranslated\n";
     for (const HotwordEntry& entry : hotwords_) {
         output << entry.phrase << '\t';
         for (std::size_t index = 0; index < entry.aliases.size(); ++index) {
@@ -611,7 +648,7 @@ bool TextProcessor::save_hotwords(const std::filesystem::path& path, std::string
             output << entry.aliases[index];
         }
         output << '\t' << (entry.enabled ? 1 : 0) << '\t' << entry.hits << '\t'
-               << entry.boost << '\n';
+               << entry.boost << '\t' << (entry.keep_untranslated ? 1 : 0) << '\n';
     }
     if (!output) {
         error = "failed to write hotwords file: " + path.string();
@@ -664,6 +701,32 @@ bool TextProcessor::save_correction_rules(const std::filesystem::path& path, std
     return true;
 }
 
+namespace {
+
+// Speech models write "me,like" / "used.The" / "Здравейте,утре": no space
+// after the mark. Add one between words of space-separated scripts, but leave
+// numbers such as 3.5 or 1,000 and Chinese text alone.
+std::string space_after_ascii_punctuation(std::string text) {
+    std::string output;
+    output.reserve(text.size() + 8);
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const unsigned char value = static_cast<unsigned char>(text[index]);
+        output.push_back(static_cast<char>(value));
+        const bool mark = value == ',' || value == '.' || value == '?' || value == '!' ||
+            value == ';' || value == ':';
+        if (!mark || index == 0 || index + 1 >= text.size()) continue;
+        const char32_t before = decode_before(text, index);
+        const char32_t after = decode_at(text, index + 1);
+        const bool digit_after = after >= U'0' && after <= U'9';
+        if (is_spaced_word_code_point(before) && is_spaced_word_code_point(after) && !digit_after) {
+            output.push_back(' ');
+        }
+    }
+    return output;
+}
+
+} // namespace
+
 std::string TextProcessor::normalize(std::string_view text) {
     std::string output;
     output.reserve(text.size());
@@ -697,14 +760,14 @@ std::string TextProcessor::normalize(std::string_view text) {
         }
         const std::size_t next = next_char_boundary(text, position);
         const std::string_view codepoint = text.substr(position, next - position);
-        if (!output.empty() && codepoint == "。" && output.back() == '。') {
+        if (!output.empty() && codepoint == "。" && output.ends_with("。")) {
             position = next;
             continue;
         }
         output.append(codepoint);
         position = next;
     }
-    return trim_ascii_space(std::move(output));
+    return trim_ascii_space(space_after_ascii_punctuation(std::move(output)));
 }
 
 std::string TextProcessor::polish_dictation(std::string_view text) {

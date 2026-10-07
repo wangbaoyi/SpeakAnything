@@ -3,6 +3,10 @@
 #include <QMetaObject>
 #include <QPointer>
 
+#ifdef __APPLE__
+#include "macos/macos_system_voice.h"
+#endif
+
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -28,7 +32,12 @@ void SpeechQueue::setActive(bool active) {
         setState(State::Off);
         return;
     }
-    if (helper_ != nullptr) return;
+    if (helper_ != nullptr || (systemVoice() && state_ == State::Ready)) return;
+    if (systemVoice()) {
+        // Synthesized in this process; nothing to load.
+        setState(State::Ready);
+        return;
+    }
     buffer_.clear();
     synthesizing_ = false;
     discard_current_ = false;
@@ -48,7 +57,21 @@ void SpeechQueue::setActive(bool active) {
         if (state_ != State::Failed) setState(State::Failed, QStringLiteral("朗读进程意外退出"));
     });
     setState(State::Loading);
-    helper_->start(helper_path_, {model_directory_, QStringLiteral("4")});
+    QStringList arguments = {model_directory_, QStringLiteral("4")};
+    if (!language_.isEmpty()) arguments.append(language_);
+    helper_->start(helper_path_, arguments);
+}
+
+void SpeechQueue::setModel(const QString& model_directory, const QString& language) {
+    if (model_directory == model_directory_ && language == language_) return;
+    const bool was_active = helper_ != nullptr || (systemVoice() && state_ == State::Ready);
+    clear();
+    stopHelper();
+    model_directory_ = model_directory;
+    language_ = language;
+    if (!was_active) return;
+    setState(State::Off);
+    setActive(true);
 }
 
 void SpeechQueue::setOutput(const QString& device_id, bool monitor) {
@@ -99,12 +122,37 @@ void SpeechQueue::setState(State state, const QString& error) {
     if (on_state_) on_state_(state, error);
 }
 
+void SpeechQueue::play(std::vector<float> samples, int sample_rate) {
+    if (monitor_player_) monitor_player_->play(samples, sample_rate);
+    if (device_player_) device_player_->play(std::move(samples), sample_rate);
+}
+
 void SpeechQueue::pump() {
-    if (state_ != State::Ready || synthesizing_ || pending_.empty() || helper_ == nullptr) return;
+    if (state_ != State::Ready || synthesizing_ || pending_.empty()) return;
+    if (!systemVoice() && helper_ == nullptr) return;
     const Request request = std::move(pending_.front());
     pending_.pop_front();
     synthesizing_ = true;
     discard_current_ = false;
+#ifdef __APPLE__
+    if (systemVoice()) {
+        QPointer<SpeechQueue> self(this);
+        macos_system_voice_synthesize(
+            request.text.toStdString(), language_.toStdString(), request.speed,
+            [self](std::vector<float> samples, int sample_rate, bool ok) {
+                QMetaObject::invokeMethod(self, [self, samples = std::move(samples), sample_rate, ok]() mutable {
+                    if (!self) return;
+                    self->synthesizing_ = false;
+                    if (!self->discard_current_) {
+                        if (ok) self->play(std::move(samples), sample_rate);
+                        else if (self->on_error_) self->on_error_(QStringLiteral("朗读合成失败"));
+                    }
+                    self->pump();
+                }, Qt::QueuedConnection);
+            });
+        return;
+    }
+#endif
     const QByteArray line = QByteArray::number(request.voice) + '\t' +
         QByteArray::number(request.speed, 'f', 2) + '\t' + request.text.toUtf8() + '\n';
     helper_->write(line);
@@ -142,10 +190,7 @@ void SpeechQueue::readOutput() {
             std::memcpy(samples.data(), buffer_.constData() + newline + 1, static_cast<std::size_t>(bytes));
             buffer_.remove(0, newline + 1 + bytes);
             synthesizing_ = false;
-            if (!discard_current_) {
-                if (monitor_player_) monitor_player_->play(samples, sample_rate_);
-                if (device_player_) device_player_->play(std::move(samples), sample_rate_);
-            }
+            if (!discard_current_) play(std::move(samples), sample_rate_);
             pump();
         } else {
             buffer_.remove(0, newline + 1);

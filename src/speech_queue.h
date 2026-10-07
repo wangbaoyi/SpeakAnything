@@ -27,6 +27,11 @@ public:
 
     // Starts the helper (loading the model) or stops it.
     void setActive(bool active);
+    // Marks the operating system's own voice (macOS) instead of a model directory.
+    static inline const QString system_voice = QStringLiteral("system");
+    // Kokoro or Piper model directory (or system_voice), plus a language hint.
+    // Restarts the helper when it is running and the model changes.
+    void setModel(const QString& model_directory, const QString& language);
     // Empty device id = nothing selected; speaking then reports an error.
     void setOutput(const QString& device_id, bool monitor);
     void speak(const QString& text, int voice, double speed);
@@ -45,9 +50,12 @@ private:
     void readOutput();
     void pump();
     void stopHelper();
+    void play(std::vector<float> samples, int sample_rate);
+    [[nodiscard]] bool systemVoice() const { return model_directory_ == system_voice; }
 
     QString helper_path_;
     QString model_directory_;
+    QString language_;
     ErrorHandler on_error_;
     StateHandler on_state_;
     QProcess* helper_ = nullptr;

@@ -1,6 +1,7 @@
 #include "audio_io.h"
 #include "fsmn_vad_engine.h"
 #include "sensevoice_engine.h"
+#include "whisper_engine.h"
 #include "stream_recognizer.h"
 #include "translator.h"
 
@@ -33,6 +34,8 @@ using NativeCharacter = char;
 
 struct Options {
     std::filesystem::path model;
+    std::filesystem::path whisper_model;
+    std::string language = "auto";
     std::filesystem::path vad;
     std::optional<std::filesystem::path> audio;
     bool microphone = false;
@@ -61,7 +64,8 @@ void print_usage() {
     std::cerr
         << "Usage:\n"
         << "  sensevoice-stream --model MODEL.gguf --vad VAD.gguf --audio FILE [options]\n"
-        << "  sensevoice-stream --model MODEL.gguf --vad VAD.gguf --mic [options]\n\n"
+        << "  sensevoice-stream --model MODEL.gguf --vad VAD.gguf --mic [options]\n"
+        << "  sensevoice-stream --whisper ggml-MODEL.bin --language bg --vad VAD.gguf --audio FILE\n\n"
         << "Options:\n"
         << "  --threads N          ggml CPU threads (default 8)\n"
         << "  --frame-ms N         input frame size in ms (default 20)\n"
@@ -145,7 +149,15 @@ std::optional<Options> parse_options(int argc, NativeCharacter** argv) {
             }
             return argv[++index];
         };
-        if (argument == "--model") {
+        if (argument == "--whisper") {
+            const NativeCharacter* value = next();
+            if (value == nullptr) return std::nullopt;
+            options.whisper_model = std::filesystem::path(value);
+        } else if (argument == "--language") {
+            const NativeCharacter* value = next();
+            if (value == nullptr) return std::nullopt;
+            options.language = option_name(value);
+        } else if (argument == "--model") {
             const NativeCharacter* value = next();
             if (value == nullptr) {
                 return std::nullopt;
@@ -279,7 +291,7 @@ std::optional<Options> parse_options(int argc, NativeCharacter** argv) {
             return std::nullopt;
         }
     }
-    if (options.model.empty() || options.vad.empty() ||
+    if ((options.model.empty() && options.whisper_model.empty()) || options.vad.empty() ||
         options.audio.has_value() == options.microphone) {
         return std::nullopt;
     }
@@ -468,16 +480,23 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    SenseVoiceEngine engine;
+    SenseVoiceEngine sensevoice;
+    WhisperEngine whisper;
     std::string error;
     const auto load_started = std::chrono::steady_clock::now();
-    if (!engine.load(options->model, options->threads, error)) {
+    const bool loaded = options->whisper_model.empty()
+        ? sensevoice.load(options->model, options->threads, error)
+        : whisper.load(options->whisper_model, options->language, options->threads, error);
+    if (!loaded) {
         std::cerr << error << '\n';
         return 1;
     }
+    SpeechEngine& engine = options->whisper_model.empty()
+        ? static_cast<SpeechEngine&>(sensevoice) : whisper;
+    engine.set_language(options->language);
     const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - load_started).count();
-    std::cerr << "SenseVoice Q8 loaded in " << load_ms << " ms\n";
+    std::cerr << "SenseVoice loaded on " << engine.device() << " in " << load_ms << " ms\n";
 
     FsmnVadEngine vad;
     const auto vad_load_started = std::chrono::steady_clock::now();
@@ -543,14 +562,14 @@ int main(int argc, char** argv) {
         const std::filesystem::path models = options->translation_models.value_or(
             executable_directory / "models");
         const auto translator_load_started = std::chrono::steady_clock::now();
-        translator = make_opus_mt_factory(models, options->threads)(*options->translate, error);
+        translator = make_default_translation_factory(models, options->threads)(*options->translate, error);
         if (!translator) {
             std::cerr << error << '\n';
             return 1;
         }
         const auto translator_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - translator_load_started).count();
-        std::cerr << "Opus-MT " << direction_code(*options->translate) << " loaded in "
+        std::cerr << "Translator " << direction_code(*options->translate) << " loaded in "
                   << translator_load_ms << " ms\n";
         translation_session.emplace(*options->translate);
     }

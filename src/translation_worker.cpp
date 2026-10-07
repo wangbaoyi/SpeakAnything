@@ -3,9 +3,8 @@
 #include <utility>
 
 std::filesystem::path opus_mt_model_directory(
-    const std::filesystem::path& models_directory, TranslationDirection direction) {
-    return models_directory /
-        (direction == TranslationDirection::ZhToEn ? "opus-mt-zh-en-ct2" : "opus-mt-en-zh-ct2");
+    const std::filesystem::path& models_directory, const TranslationDirection& direction) {
+    return models_directory / ("opus-mt-" + direction_code(direction) + "-ct2");
 }
 
 TranslationWorker::TranslationWorker(
@@ -38,11 +37,12 @@ void TranslationWorker::unload() {
     push(std::move(command));
 }
 
-void TranslationWorker::translate(std::uint64_t ticket, std::string text) {
+void TranslationWorker::translate(std::uint64_t ticket, std::string text, TranslationHints hints) {
     Command command;
     command.kind = Command::Kind::Translate;
     command.ticket = ticket;
     command.text = std::move(text);
+    command.hints = std::move(hints);
     push(std::move(command));
 }
 
@@ -92,7 +92,7 @@ void TranslationWorker::run() {
             std::string error;
             std::optional<std::string> translation;
             if (translator_) {
-                translation = translator_->translate(command.text, error);
+                translation = translator_->translate(command.text, command.hints, error);
             } else {
                 error = "translation model is not loaded";
             }

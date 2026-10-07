@@ -5,3 +5,6 @@
 .vs/
 __pycache__/
 /out-*.log
+/build-mac/
+/third_party/sherpa-onnx-macos/
+/build-mac-release/

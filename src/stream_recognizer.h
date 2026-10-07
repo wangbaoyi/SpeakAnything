@@ -65,7 +65,7 @@ public:
     using EventHandler = std::function<void(const RecognitionEvent&)>;
 
     StreamRecognizer(
-        SenseVoiceEngine& engine,
+        SpeechEngine& engine,
         FsmnVadEngine* vad,
         StreamRecognizerConfig config,
         EventHandler handler,
@@ -93,7 +93,7 @@ private:
     void emit_result(const SenseVoiceResult& result, bool final_result);
     void emit_error(const std::string& error);
 
-    SenseVoiceEngine& engine_;
+    SpeechEngine& engine_;
     FsmnVadEngine* vad_;
     StreamRecognizerConfig config_;
     EventHandler handler_;

@@ -4,12 +4,23 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
-enum class TranslationDirection {
-    ZhToEn,
-    EnToZh,
+// Source and target language codes (see languages.h), e.g. {"zh", "en"}.
+struct TranslationDirection {
+    std::string source = "zh";
+    std::string target = "en";
+
+    static const TranslationDirection ZhToEn;
+    static const TranslationDirection EnToZh;
+
+    [[nodiscard]] TranslationDirection reversed() const { return {target, source}; }
+    bool operator==(const TranslationDirection&) const = default;
 };
+
+inline const TranslationDirection TranslationDirection::ZhToEn{"zh", "en"};
+inline const TranslationDirection TranslationDirection::EnToZh{"en", "zh"};
 
 enum class TextLanguage {
     Unknown,
@@ -19,8 +30,9 @@ enum class TextLanguage {
 
 // Counts CJK characters against Latin words; Unknown when neither appears.
 TextLanguage detect_text_language(std::string_view text);
-TextLanguage source_language(TranslationDirection direction);
-const char* direction_code(TranslationDirection direction);
+TextLanguage source_language(const TranslationDirection& direction);
+// "zh-en"; parse accepts any pair of known language codes.
+std::string direction_code(const TranslationDirection& direction);
 std::optional<TranslationDirection> parse_direction_code(std::string_view code);
 
 enum class SentenceTranslationState {
@@ -48,8 +60,10 @@ struct SessionInjection {
 class TranslationSession {
 public:
     explicit TranslationSession(TranslationDirection direction);
+    TranslationSession(const TranslationSession&) = default;
+    TranslationSession& operator=(const TranslationSession&) = default;
 
-    [[nodiscard]] TranslationDirection direction() const;
+    [[nodiscard]] const TranslationDirection& direction() const;
 
     // Returns the sentence index, or nullopt for blank text. A sentence whose
     // language contradicts the direction is settled as LanguageMismatch at once.
@@ -62,6 +76,13 @@ public:
     [[nodiscard]] bool is_pending(std::size_t index) const;
     [[nodiscard]] std::string original_text() const;
     [[nodiscard]] std::string translated_text() const;
+    [[nodiscard]] std::size_t size() const { return sentences_.size(); }
+    [[nodiscard]] SentenceTranslationState state(std::size_t index) const { return sentences_[index].state; }
+    [[nodiscard]] const std::string& translation(std::size_t index) const {
+        return sentences_[index].translation;
+    }
+    // Sentences translated so far, original first, in order.
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>> translated_pairs() const;
 
     // timed_out: the caller stopped waiting; pending sentences count as Timeout.
     [[nodiscard]] SessionInjection compose(std::string_view separator, bool timed_out) const;

@@ -17,6 +17,18 @@ int main() {
     assert(result.matched_hotwords.front() == "SenseVoice");
     assert(processor.hotwords().front().hits == 1);
 
+    // English from SenseVoice comes without spaces after punctuation.
+    assert(TextProcessor::normalize("tell me,like when I used.The app?Yes") ==
+        "tell me, like when I used. The app? Yes");
+    assert(TextProcessor::normalize("version 3.5 costs 1,000 yuan") ==
+        "version 3.5 costs 1,000 yuan");
+    assert(TextProcessor::normalize("今天,我们开会.") == "今天,我们开会.");
+    assert(TextProcessor::normalize("Здравейте,утре след обед.Добре") ==
+        "Здравейте, утре след обед. Добре");
+    assert(TextProcessor::polish_dictation("Здравейте, утре ще обсъдим.") ==
+        "Здравейте, утре ще обсъдим.");
+    assert(TextProcessor::polish_dictation("Grüße aus München.") == "Grüße aus München.");
+
 
     const std::filesystem::path path =
         std::filesystem::temp_directory_path() / "sensevoice-text-processor.tsv";
