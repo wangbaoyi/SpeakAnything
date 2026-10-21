@@ -1,5 +1,7 @@
 #pragma once
 
+#include "compute_policy.h"
+
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -46,7 +48,11 @@ public:
     SenseVoiceEngine(const SenseVoiceEngine&) = delete;
     SenseVoiceEngine& operator=(const SenseVoiceEngine&) = delete;
 
-    bool load(const std::filesystem::path& model_path, int threads, std::string& error);
+    // policy: Auto runs on a GPU when ggml provides one and every graph op is
+    // supported, otherwise on the CPU; Cpu never uses a GPU; Gpu fails to load
+    // when no GPU is available.
+    bool load(const std::filesystem::path& model_path, int threads, std::string& error,
+              ComputePolicy policy = ComputePolicy::Auto);
     [[nodiscard]] bool loaded() const override;
     // Drops a loaded or half-loaded model so load() can try another one.
     void reset();

@@ -8,3 +8,6 @@ __pycache__/
 /build-mac/
 /third_party/sherpa-onnx-macos/
 /build-mac-release/
+/build-*/
+/modelspt/
+/驱动/

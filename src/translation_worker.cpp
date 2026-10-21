@@ -4,7 +4,15 @@
 
 std::filesystem::path opus_mt_model_directory(
     const std::filesystem::path& models_directory, const TranslationDirection& direction) {
-    return models_directory / ("opus-mt-" + direction_code(direction) + "-ct2");
+    const std::filesystem::path name =
+        "opus-mt-" + direction_code(direction) + "-ct2";
+    const std::filesystem::path flat = models_directory / name;
+    std::error_code error;
+    if (std::filesystem::exists(flat, error) && !error) return flat;
+    // Callers may pass either the models root or its translator/ folder.
+    const std::filesystem::path categorised = models_directory / "translator" / name;
+    if (std::filesystem::exists(categorised, error) && !error) return categorised;
+    return flat;
 }
 
 TranslationWorker::TranslationWorker(
@@ -68,7 +76,11 @@ void TranslationWorker::run() {
         switch (command.kind) {
         case Command::Kind::Load: {
             if (translator_ && loaded_direction_ == command.direction) {
-                if (on_loaded_) on_loaded_(command.direction, true, {});
+                if (on_loaded_) {
+                    on_loaded_(command.direction, true, {},
+                        TranslationModelInfo{std::string(translator_->backend_name()),
+                                             translator_->device_label()});
+                }
                 break;
             }
             // Free the old model first so two directions are never resident together.
@@ -81,7 +93,13 @@ void TranslationWorker::run() {
             } else if (error.empty()) {
                 error = "translator factory returned no model";
             }
-            if (on_loaded_) on_loaded_(command.direction, translator_ != nullptr, error);
+            if (on_loaded_) {
+                const TranslationModelInfo info = translator_
+                    ? TranslationModelInfo{std::string(translator_->backend_name()),
+                                           translator_->device_label()}
+                    : TranslationModelInfo{};
+                on_loaded_(command.direction, translator_ != nullptr, error, info);
+            }
             break;
         }
         case Command::Kind::Unload:

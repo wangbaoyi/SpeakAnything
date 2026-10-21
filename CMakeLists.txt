@@ -27,7 +27,57 @@ set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE ON CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 
+# Windows CUDA is opt-in at configure time but automatic when a toolkit is
+# installed: a machine without one still gets the CPU-only build, and the app
+# reports the missing GPU instead of failing to configure. Pass
+# -DSENSEVOICE_WITH_CUDA=OFF for a deterministic CPU build, or
+# -DSENSEVOICE_CUDA_REQUIRED=ON to make a missing toolkit a configure error.
+if(WIN32)
+    option(SENSEVOICE_WITH_CUDA
+        "Build the ggml CUDA backend when a CUDA toolkit is available" ON)
+    option(SENSEVOICE_CUDA_REQUIRED
+        "Fail the configure when SENSEVOICE_WITH_CUDA is ON but no toolkit exists" OFF)
+    if(SENSEVOICE_WITH_CUDA)
+        find_package(CUDAToolkit QUIET)
+        if(CUDAToolkit_FOUND)
+            set(GGML_CUDA ON CACHE BOOL "" FORCE)
+            message(STATUS "CUDA ${CUDAToolkit_VERSION} found; building the ggml CUDA backend")
+            if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13")
+                # CUDA 13 dropped Maxwell, Pascal and Volta device code. The
+                # backend still builds, but sm_61 needs a 12.x toolkit.
+                message(WARNING
+                    "CUDA ${CUDAToolkit_VERSION} no longer generates Pascal (sm_61) code; "
+                    "use CUDA 12.6.x for a GeForce GTX 10 series GPU")
+            endif()
+        elseif(SENSEVOICE_CUDA_REQUIRED)
+            message(FATAL_ERROR
+                "SENSEVOICE_WITH_CUDA is ON and SENSEVOICE_CUDA_REQUIRED is ON, "
+                "but no CUDA toolkit was found")
+        else()
+            message(STATUS "CUDA toolkit not found; building CPU-only")
+        endif()
+    else()
+        message(STATUS "SENSEVOICE_WITH_CUDA=OFF; building CPU-only")
+    endif()
+endif()
+
+# ggml's CUDA language targets default to the static CUDA runtime, while
+# CTranslate2's FindCUDA links cudart.lib (the import library for the DLL).
+# Both in one image means duplicate cuda* symbols (LNK2005), so keep the whole
+# app on the shared runtime, which is also the DLL that release packaging ships.
+if(GGML_CUDA)
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared CACHE STRING "" FORCE)
+endif()
+
 add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
+
+# llama.cpp still writes u8"..." literals, which MSVC treats as char8_t under
+# C++20. Pin the library to C++17 (its own declared minimum) so the Qwen
+# translation path builds on Windows alongside this project's C++20 code.
+if(TARGET llama)
+    set_target_properties(llama PROPERTIES
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+endif()
 
 # CTranslate2 forces the static CRT when built static; keep every target on the
 # project's dynamic CRT so they link into one image.
@@ -46,33 +96,40 @@ function(sensevoice_use_dynamic_crt directory)
     endforeach()
 endfunction()
 
+# Both translation backends can be compiled into one binary; ComputePolicy
+# chooses at runtime (CPU -> Opus-MT, GPU -> Qwen GGUF, Auto -> best available).
+# The old single-backend cache entry stays declared so existing build trees do
+# not warn about an unused variable, but it no longer selects anything.
+set(SENSEVOICE_TRANSLATION_BACKEND "" CACHE STRING
+    "Deprecated: the translation backend is chosen at runtime by ComputePolicy")
+# Keep the old platform default for Opus-MT: macOS shipped LLM-only and should
+# not start building CTranslate2 unless asked. The LLM path is now also built
+# on Windows, where the CUDA build must be able to run Qwen.
 if(APPLE)
-    set(SENSEVOICE_TRANSLATION_BACKEND_DEFAULT llm)
-else()
-    set(SENSEVOICE_TRANSLATION_BACKEND_DEFAULT opus-mt)
-endif()
-set(SENSEVOICE_TRANSLATION_BACKEND ${SENSEVOICE_TRANSLATION_BACKEND_DEFAULT} CACHE STRING
-    "opus-mt: Opus-MT through CTranslate2 (CPU); llm: Qwen3 GGUF through llama.cpp (Metal GPU on macOS)")
-set_property(CACHE SENSEVOICE_TRANSLATION_BACKEND PROPERTY STRINGS opus-mt llm)
-if(SENSEVOICE_TRANSLATION_BACKEND STREQUAL "llm")
     set(SENSEVOICE_WITH_TRANSLATION_DEFAULT OFF)
 else()
     set(SENSEVOICE_WITH_TRANSLATION_DEFAULT ON)
 endif()
 option(SENSEVOICE_WITH_TRANSLATION "Build Opus-MT translation through CTranslate2"
     ${SENSEVOICE_WITH_TRANSLATION_DEFAULT})
+option(SENSEVOICE_WITH_LLM_TRANSLATION "Build Qwen GGUF translation through llama.cpp" ON)
 
 add_library(sensevoice_translation STATIC
     src/languages.cpp
     src/opus_mt_translator.cpp
+    src/translation_backend.cpp
     src/translation_session.cpp
     src/translation_worker.cpp
 )
 target_include_directories(sensevoice_translation PUBLIC src)
-if(SENSEVOICE_TRANSLATION_BACKEND STREQUAL "llm")
+if(SENSEVOICE_WITH_LLM_TRANSLATION)
     target_sources(sensevoice_translation PRIVATE src/llm_translator.cpp)
     target_compile_definitions(sensevoice_translation PUBLIC SENSEVOICE_WITH_LLM_TRANSLATION)
     target_link_libraries(sensevoice_translation PRIVATE llama)
+endif()
+if(GGML_CUDA)
+    # "this build has no CUDA" versus "CUDA is compiled in but no device".
+    target_compile_definitions(sensevoice_translation PRIVATE SENSEVOICE_WITH_CUDA)
 endif()
 
 # Shared by Opus-MT and the Core ML SenseVoice tokenizer.
@@ -87,6 +144,60 @@ macro(sensevoice_add_sentencepiece)
 endmacro()
 
 if(SENSEVOICE_WITH_TRANSLATION)
+    # CTranslate2 has its own CUDA backend, independent of ggml: Opus-MT can
+    # run on the GPU while speech recognition stays on the CPU. The default is
+    # ON only when a toolkit is installed, so a CPU-only machine configures
+    # exactly as before. `SENSEVOICE_CT2_CUDA_AVAILABLE` records whether the
+    # CUDA translation backend is actually compiled in (packaging reads it).
+    set(_sensevoice_ct2_cuda_default OFF)
+    if(NOT APPLE)
+        find_package(CUDAToolkit QUIET)
+        if(CUDAToolkit_FOUND)
+            set(_sensevoice_ct2_cuda_default ON)
+        endif()
+    endif()
+    option(SENSEVOICE_CT2_CUDA
+        "Build CTranslate2 with CUDA support for Opus-MT" ${_sensevoice_ct2_cuda_default})
+    set(SENSEVOICE_CT2_CUDA_AVAILABLE OFF CACHE INTERNAL
+        "CTranslate2 was configured with WITH_CUDA=ON" FORCE)
+
+    if(SENSEVOICE_CT2_CUDA)
+        if(APPLE OR NOT CUDAToolkit_FOUND)
+            message(STATUS
+                "SENSEVOICE_CT2_CUDA is ON but no CUDA toolkit was found; Opus-MT stays CPU-only")
+        else()
+            if(CUDAToolkit_BIN_DIR)
+                get_filename_component(_sensevoice_cuda_root
+                    "${CUDAToolkit_BIN_DIR}/.." ABSOLUTE)
+            else()
+                set(_sensevoice_cuda_root "${CUDAToolkit_ROOT}")
+            endif()
+            # FindCUDA (used by CTranslate2 4.8) reads CUDA_TOOLKIT_ROOT_DIR,
+            # and dynamic loading lets one binary start on a machine without a
+            # GPU. CMake 3.27+ hides FindCUDA unless CMP0146 is OLD; the
+            # subdirectory's cmake_minimum_required(3.7) leaves it unset, but
+            # state it explicitly so a future policy default cannot break it.
+            set(CMAKE_POLICY_DEFAULT_CMP0146 OLD)
+            # CTranslate2 compiles its .cu files through FindCUDA, which
+            # supplies the gencode flags; CMP0104 NEW would also demand
+            # CMAKE_CUDA_ARCHITECTURES for the target.
+            set(CMAKE_POLICY_DEFAULT_CMP0104 OLD)
+            set(CUDA_TOOLKIT_ROOT_DIR "${_sensevoice_cuda_root}" CACHE PATH "" FORCE)
+            set(WITH_CUDA ON CACHE BOOL "" FORCE)
+            set(WITH_CUDNN OFF CACHE BOOL "" FORCE)
+            set(CUDA_ARCH_LIST "6.1" CACHE STRING "" FORCE)
+            set(CUDA_DYNAMIC_LOADING ON CACHE BOOL "" FORCE)
+            # FindCUDA defaults to the static CUDA runtime. ggml links the
+            # shared cudart, and both in one image duplicate every cuda* symbol
+            # (LNK2005 on MSVC). The shared runtime is also the DLL packaged.
+            set(CUDA_USE_STATIC_CUDA_RUNTIME OFF CACHE BOOL "" FORCE)
+            set(SENSEVOICE_CT2_CUDA_AVAILABLE ON CACHE INTERNAL
+                "CTranslate2 was configured with WITH_CUDA=ON" FORCE)
+            message(STATUS
+                "CTranslate2 CUDA enabled (CUDA ${CUDAToolkit_VERSION}, sm_61, dynamic loading)")
+        endif()
+    endif()
+
     # Ruy keeps the build free of MKL/oneDNN; see docs/adr/0001-ctranslate2-for-opus-mt.md.
     set(WITH_MKL OFF CACHE BOOL "" FORCE)
     if(APPLE)
@@ -102,9 +213,26 @@ if(SENSEVOICE_WITH_TRANSLATION)
     endif()
     set(BUILD_CLI OFF CACHE BOOL "" FORCE)
     set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    # CTranslate2 hard-codes /MT for static MSVC builds, including its CUDA
+    # host code, while this app and Qt use /MD. Only the CUDA configuration
+    # hits that path, so build CTranslate2 shared just for it: the shared
+    # configuration uses /MD and links cleanly. CPU-only builds stay static.
+    set(SENSEVOICE_CT2_SHARED OFF)
+    if(MSVC AND SENSEVOICE_CT2_CUDA_AVAILABLE)
+        set(BUILD_SHARED_LIBS ON)
+        set(SENSEVOICE_CT2_SHARED ON)
+    endif()
     add_subdirectory(third_party/CTranslate2 EXCLUDE_FROM_ALL)
+    if(SENSEVOICE_CT2_SHARED)
+        set(BUILD_SHARED_LIBS OFF)
+    endif()
     if(MSVC)
         sensevoice_use_dynamic_crt(third_party/CTranslate2)
+    endif()
+    if(SENSEVOICE_CT2_CUDA_AVAILABLE)
+        # PUBLIC so translation tests can exercise the CUDA selection matrix
+        # even on a machine where the backend would not run.
+        target_compile_definitions(sensevoice_translation PUBLIC SENSEVOICE_CT2_CUDA)
     endif()
 
     sensevoice_add_sentencepiece()
@@ -157,6 +285,8 @@ endif()
 
 add_library(sensevoice_core STATIC
     src/audio_conditioner.cpp
+    src/compute_policy.cpp
+    src/fbank.cpp
     src/fsmn_vad_engine.cpp
     src/hotword_boost.cpp
     src/sensevoice_engine.cpp
@@ -168,6 +298,11 @@ add_library(sensevoice_core STATIC
 )
 target_include_directories(sensevoice_core PUBLIC src)
 target_link_libraries(sensevoice_core PUBLIC ggml whisper)
+if(GGML_CUDA)
+    # Lets the compute policy tell "no CUDA in this build" apart from
+    # "CUDA is compiled in but no device initialized".
+    target_compile_definitions(sensevoice_core PUBLIC SENSEVOICE_WITH_CUDA)
+endif()
 if(APPLE)
     target_link_libraries(sensevoice_core PUBLIC "-framework CoreAudio")
 
@@ -268,6 +403,9 @@ if(WIN32)
         mfreadwrite
         mfuuid
     )
+    # The manifest resource declares UTF-8 as the active code page so vendored
+    # C libraries can open model paths that contain non-ASCII characters.
+    target_link_options(sensevoice-ui PRIVATE /MANIFEST:NO)
 
     # Kokoro speech synthesis lives in its own process; see
     # docs/adr/0002-kokoro-tts-in-separate-process.md. sherpa-onnx is the
@@ -437,6 +575,7 @@ if(TARGET sensevoice-ui)
 endif()
 
 enable_testing()
+find_package(Threads REQUIRED)
 add_executable(stability-tracker-test
     tests/stability_tracker_test.cpp
     src/stability_tracker.cpp
@@ -470,6 +609,44 @@ if(MSVC)
 endif()
 add_test(NAME audio-conditioner-test COMMAND audio-conditioner-test)
 
+add_executable(compute-policy-test
+    tests/compute_policy_test.cpp
+    src/compute_policy.cpp
+)
+target_include_directories(compute-policy-test PRIVATE src)
+target_link_libraries(compute-policy-test PRIVATE ggml)
+if(GGML_CUDA)
+    target_compile_definitions(compute-policy-test PRIVATE SENSEVOICE_WITH_CUDA)
+endif()
+if(MSVC)
+    target_compile_options(compute-policy-test PRIVATE /utf-8 /W4 /permissive-)
+endif()
+add_test(NAME compute-policy-test COMMAND compute-policy-test)
+
+# Shared log-mel front end. The unit test proves the parallel frame split is
+# byte-identical to the serial path; the benchmark prints 1-thread versus
+# 4-thread timings for a deterministic 5 s signal.
+add_executable(fbank-test
+    tests/fbank_test.cpp
+    src/fbank.cpp
+)
+target_include_directories(fbank-test PRIVATE src)
+target_link_libraries(fbank-test PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(fbank-test PRIVATE /utf-8 /W4 /permissive-)
+endif()
+add_test(NAME fbank-test COMMAND fbank-test)
+
+add_executable(fbank-benchmark
+    tests/fbank_benchmark.cpp
+    src/fbank.cpp
+)
+target_include_directories(fbank-benchmark PRIVATE src)
+target_link_libraries(fbank-benchmark PRIVATE Threads::Threads)
+if(MSVC)
+    target_compile_options(fbank-benchmark PRIVATE /utf-8 /W4 /permissive-)
+endif()
+
 add_executable(hotword-boost-test
     tests/hotword_boost_test.cpp
     src/hotword_boost.cpp
@@ -484,10 +661,46 @@ add_executable(translator-test
     tests/translator_test.cpp
 )
 target_link_libraries(translator-test PRIVATE sensevoice_translation)
+if(EXISTS "${CMAKE_SOURCE_DIR}/modelspt/opus-mt-zh-en-ct2/model.bin" OR
+   EXISTS "${CMAKE_SOURCE_DIR}/modelspt/translator/opus-mt-zh-en-ct2/model.bin")
+    set(SENSEVOICE_TEST_MODELS_DIR "${CMAKE_SOURCE_DIR}/modelspt")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/models/opus-mt-zh-en-ct2/model.bin" OR
+       EXISTS "${CMAKE_SOURCE_DIR}/models/translator/opus-mt-zh-en-ct2/model.bin")
+    set(SENSEVOICE_TEST_MODELS_DIR "${CMAKE_SOURCE_DIR}/models")
+else()
+    set(SENSEVOICE_TEST_MODELS_DIR "${CMAKE_SOURCE_DIR}/modelspt")
+endif()
 target_compile_definitions(translator-test PRIVATE
-    SENSEVOICE_TEST_MODELS_DIR="${CMAKE_SOURCE_DIR}/models"
+    SENSEVOICE_TEST_MODELS_DIR="${SENSEVOICE_TEST_MODELS_DIR}"
 )
 if(MSVC)
     target_compile_options(translator-test PRIVATE /utf-8 /W4 /permissive-)
 endif()
 add_test(NAME translator-test COMMAND translator-test)
+
+if(TARGET Qt6::Core)
+    add_executable(model-manager-test
+        tests/model_manager_test.cpp
+        src/model_catalog.cpp
+        src/model_manager.cpp
+    )
+    target_include_directories(model-manager-test PRIVATE src)
+    target_link_libraries(model-manager-test PRIVATE Qt6::Core Qt6::Network)
+    if(MSVC)
+        target_compile_options(model-manager-test PRIVATE /utf-8 /W4 /permissive-)
+    endif()
+    add_test(NAME model-manager-test COMMAND model-manager-test)
+endif()
+
+if(SENSEVOICE_CT2_SHARED)
+    # The CUDA translation build links CTranslate2 as a DLL; every executable
+    # that uses it needs the DLL beside it, tests included.
+    foreach(target sensevoice-stream sensevoice-ui translator-test)
+        if(TARGET ${target})
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:ctranslate2>"
+                    "$<TARGET_FILE_DIR:${target}>")
+        endif()
+    endforeach()
+endif()

@@ -77,6 +77,7 @@ public:
     [[nodiscard]] std::string original_text() const;
     [[nodiscard]] std::string translated_text() const;
     [[nodiscard]] std::size_t size() const { return sentences_.size(); }
+    [[nodiscard]] const std::string& original(std::size_t index) const;
     [[nodiscard]] SentenceTranslationState state(std::size_t index) const { return sentences_[index].state; }
     [[nodiscard]] const std::string& translation(std::size_t index) const {
         return sentences_[index].translation;

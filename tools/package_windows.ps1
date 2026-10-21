@@ -5,7 +5,7 @@ param(
 )
 
 # Builds the portable ZIP: executables, Qt runtime, dictionaries and every
-# model under models/ (see README "Models"). Models are not in git.
+# model under modelspt/ (see README "Models"). Models are not in git.
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -20,17 +20,22 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
 }
 
-$modelsSource = Join-Path $root 'models'
+$modelsSource = Join-Path $root 'modelspt'
+if (-not (Test-Path -LiteralPath $modelsSource)) { $modelsSource = Join-Path $root 'models' }
 $requiredModels = @(
-    'sensevoice-small-q8.gguf',
-    'fsmn-vad.gguf',
-    'opus-mt-zh-en-ct2\model.bin',
-    'opus-mt-en-zh-ct2\model.bin',
-    'kokoro-multi-lang-v1_1\model.onnx'
+    @{ Path = 'sensevoice-small-q8.gguf'; Kind = 'recognizer' },
+    @{ Path = 'fsmn-vad.gguf'; Kind = 'recognizer' },
+    @{ Path = 'opus-mt-zh-en-ct2\model.bin'; Kind = 'translator' },
+    @{ Path = 'opus-mt-en-zh-ct2\model.bin'; Kind = 'translator' },
+    @{ Path = 'kokoro-multi-lang-v1_1\model.onnx'; Kind = 'voice' }
 )
 foreach ($model in $requiredModels) {
-    if (-not (Test-Path -LiteralPath (Join-Path $modelsSource $model))) {
-        throw "Missing model: models\$model (see README)"
+    $candidates = @(
+        (Join-Path $modelsSource (Join-Path $model.Kind $model.Path)),
+        (Join-Path $modelsSource $model.Path)
+    )
+    if (-not ($candidates | Where-Object { Test-Path -LiteralPath $_ })) {
+        throw "Missing model: $($model.Kind)\$($model.Path) or $($model.Path) under $modelsSource (see README)"
     }
 }
 
@@ -40,6 +45,38 @@ New-Item -ItemType Directory -Force -Path $packageDirectory | Out-Null
 foreach ($file in @('sensevoice-ui.exe', 'sensevoice-stream.exe', 'sensevoice-tts.exe',
                     'sherpa-onnx-c-api.dll', 'onnxruntime.dll', 'onnxruntime_providers_shared.dll')) {
     Copy-Item -LiteralPath (Join-Path $binaryDirectory $file) -Destination $packageDirectory -Force
+}
+
+# The CUDA translation build links CTranslate2 as a DLL.
+$ct2Dll = Join-Path $binaryDirectory 'ctranslate2.dll'
+if (Test-Path -LiteralPath $ct2Dll) {
+    Copy-Item -LiteralPath $ct2Dll -Destination $packageDirectory -Force
+}
+
+# The ggml CUDA backend is linked statically, but the CUDA runtime and cuBLAS
+# stay dynamic. CTranslate2 CUDA also loads them at runtime
+# (CUDA_DYNAMIC_LOADING=ON). Copy them when either backend was compiled in.
+$cachePath = Join-Path $buildDirectory 'CMakeCache.txt'
+$ggmlCuda = Select-String -Path $cachePath -Pattern '^GGML_CUDA:BOOL=ON$' -Quiet
+$ct2Cuda = (Select-String -Path $cachePath -Pattern '^SENSEVOICE_CT2_CUDA:BOOL=ON$' -Quiet) -and
+    (Select-String -Path $cachePath -Pattern '^SENSEVOICE_CT2_CUDA_AVAILABLE:INTERNAL=ON$' -Quiet)
+$cudaBuild = $ggmlCuda -or $ct2Cuda
+if ($cudaBuild) {
+    $cudaBin = $null
+    $cudaCache = Select-String -Path $cachePath -Pattern '^CUDAToolkit_BIN_DIR:PATH=(.*)$' |
+        Select-Object -First 1
+    if ($cudaCache) { $cudaBin = $cudaCache.Matches[0].Groups[1].Value }
+    if (-not $cudaBin -and $env:CUDA_PATH) { $cudaBin = Join-Path $env:CUDA_PATH 'bin' }
+    if (-not $cudaBin -or -not (Test-Path -LiteralPath $cudaBin)) {
+        throw 'The build uses CUDA but the CUDA bin directory was not found.'
+    }
+    $cudaDlls = Get-ChildItem -LiteralPath $cudaBin -Filter '*.dll' |
+        Where-Object { $_.Name -match '^(cudart64_|cublas64_|cublasLt64_)' }
+    if (-not $cudaDlls) { throw "Missing CUDA runtime DLLs in $cudaBin." }
+    foreach ($dll in $cudaDlls) {
+        Copy-Item -LiteralPath $dll.FullName -Destination $packageDirectory -Force
+    }
+    Write-Output "Packaged CUDA runtime: $($cudaDlls.Name -join ', ')"
 }
 
 $windeployqt = Get-Command windeployqt -ErrorAction SilentlyContinue
@@ -68,10 +105,20 @@ foreach ($file in @('jieba.dict.utf8', 'user.dict.utf8')) {
     Copy-Item -LiteralPath (Join-Path $root "third_party\cppjieba\dict\$file") -Destination $dictionary -Force
 }
 
-$packageModels = Join-Path $packageDirectory 'models'
+$packageModels = Join-Path $packageDirectory 'modelspt'
 New-Item -ItemType Directory -Force -Path $packageModels | Out-Null
+foreach ($category in @('recognizer', 'translator', 'voice')) {
+    $source = Join-Path $modelsSource $category
+    if (Test-Path -LiteralPath $source) {
+        Copy-Item -LiteralPath $source -Destination $packageModels -Recurse -Force
+    }
+}
+# Flat layouts from older installs.
 foreach ($entry in @('sensevoice-small-q8.gguf', 'fsmn-vad.gguf', 'opus-mt-zh-en-ct2', 'opus-mt-en-zh-ct2', 'kokoro-multi-lang-v1_1')) {
-    Copy-Item -LiteralPath (Join-Path $modelsSource $entry) -Destination $packageModels -Recurse -Force
+    $source = Join-Path $modelsSource $entry
+    if (Test-Path -LiteralPath $source) {
+        Copy-Item -LiteralPath $source -Destination $packageModels -Recurse -Force
+    }
 }
 
 foreach ($file in @('install.ps1', 'install.cmd', 'uninstall.ps1', 'README.txt')) {

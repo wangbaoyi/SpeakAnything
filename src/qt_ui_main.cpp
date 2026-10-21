@@ -57,6 +57,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QLinearGradient>
+#include <QListWidget>
 #include <QLocale>
 #include <QMessageBox>
 #include <QMenu>
@@ -73,12 +74,12 @@
 #include <QShowEvent>
 #include <QSlider>
 #include <QSpinBox>
+#include <QStackedWidget>
 #include <QStandardPaths>
 #include <QStyle>
 #include <QStyleHints>
 #include <QSystemTrayIcon>
 #include <QTableWidget>
-#include <QTabWidget>
 #include <QTextCursor>
 #include <QTextDocument>
 #include <QTextOption>
@@ -91,6 +92,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <clocale>
 #include <cmath>
 #include <filesystem>
 #include <functional>
@@ -101,6 +103,7 @@
 #include <random>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -211,6 +214,8 @@ constexpr auto default_translation_separator = " / ";
 struct TranslationSettings {
     bool enabled = false;
     TranslationDirection direction = TranslationDirection::ZhToEn;
+    // Translation has its own device, independent of recognition.
+    ComputePolicy device = ComputePolicy::Auto;
     QString separator = QString::fromLatin1(default_translation_separator);
 };
 
@@ -363,7 +368,7 @@ enum class TextMode {
 
 enum class ResultDestination { Insert, CopyOnly };
 enum class ResultContent { Original, Translation, Both };
-enum class HotkeyTrigger { Hold, Toggle };
+enum class HotkeyTrigger { Hold, Toggle, Realtime };
 
 constexpr int toggle_session_limit_ms = 5 * 60 * 1000;
 
@@ -502,11 +507,49 @@ QString dataDirectory() {
     const QString app_directory = QCoreApplication::applicationDirPath();
 #ifdef __APPLE__
     const QString resources = QDir(app_directory).absoluteFilePath(QStringLiteral("../Resources"));
-    if (QFileInfo::exists(QDir(resources).filePath(QStringLiteral("models")))) {
+    if (QFileInfo::exists(QDir(resources).filePath(QStringLiteral("modelspt"))) ||
+        QFileInfo::exists(QDir(resources).filePath(QStringLiteral("models")))) {
         return QDir::cleanPath(resources);
     }
 #endif
     return app_directory;
+}
+
+// Models live in modelspt next to the executable. Older installs used models;
+// it stays as a fallback so updates do not lose an existing download.
+QString packagedModelsDirectory() {
+    return QDir(dataDirectory()).filePath(QStringLiteral("modelspt"));
+}
+
+std::filesystem::path packagedModelPath(const std::string& relative, ModelKind kind) {
+    const std::filesystem::path base(dataDirectory().toStdWString());
+    const std::filesystem::path suffix(QString::fromStdString(relative).toStdWString());
+    const std::filesystem::path category(QString::fromStdString(
+        std::string(model_kind_folder(kind))).toStdWString());
+    std::filesystem::path preferred;
+    for (const wchar_t* name : {L"modelspt", L"models"}) {
+        const std::filesystem::path directory = base / name;
+        preferred = directory / category / suffix;
+        if (std::filesystem::exists(preferred)) return preferred;
+        const std::filesystem::path flat = directory / suffix;
+        if (std::filesystem::exists(flat)) return flat;
+    }
+    return base / L"modelspt" / category / suffix;
+}
+
+std::filesystem::path packagedTranslationModelsDirectory() {
+    const std::filesystem::path base(dataDirectory().toStdWString());
+    for (const wchar_t* name : {L"modelspt", L"models"}) {
+        const std::filesystem::path directory = base / name;
+        const std::filesystem::path categorised = directory / L"translator";
+        for (const std::filesystem::path& candidate : {categorised, directory}) {
+            if (std::filesystem::exists(candidate / L"opus-mt-zh-en-ct2") ||
+                std::filesystem::exists(candidate / L"opus-mt-en-zh-ct2")) {
+                return candidate;
+            }
+        }
+    }
+    return base / L"modelspt" / L"translator";
 }
 
 // "auto", "zh" or "en"; stored with the other settings.
@@ -1566,6 +1609,8 @@ private:
 class InputSettingsDialog final : public QDialog {
 public:
     InputSettingsDialog(const VadSettings& values,
+                        ComputePolicy compute,
+                        ComputePolicy translation_compute,
                         const QString& shortcut,
                         TextMode mode,
                         HotkeyTrigger trigger,
@@ -1573,7 +1618,9 @@ public:
                         ResultContent input_content,
                         ResultContent clipboard_content,
                         int paste_delay_ms,
+                        int clipboard_ttl_seconds,
                         bool startup_enabled,
+                        bool mute_while_recording,
                         const std::vector<HotwordEntry>& hotwords,
                         const TranslationSettings& translation,
                         const SpeechSettings& speech,
@@ -1584,17 +1631,22 @@ public:
                         ModelChoices model_choices = {},
                         QWidget* parent = nullptr)
         : QDialog(parent), appearance_(appearance), bubble_style_(bubble_style),
+          compute_policy_(compute), translation_compute_policy_(translation_compute),
           model_manager_(model_manager), initial_model_choices_(std::move(model_choices)),
           on_appearance_changed_(std::move(on_appearance_changed)) {
         setWindowTitle(Ui::tr("语音输入设置"));
         setWindowFlag(Qt::WindowContextHelpButtonHint, false);
-        resize(760, 720);
-        setMinimumSize(600, 520);
+        resize(880, 740);
+        setMinimumSize(680, 540);
 #ifdef __APPLE__
         // Native macOS controls, fonts and dark mode; only the cards get a
         // style, built from palette roles so it follows light and dark.
         setStyleSheet(QStringLiteral(
             "QScrollArea, QScrollArea > QWidget > QWidget#page { background: transparent; border: none; }"
+            "QListWidget#settingsSidebar { background: rgba(128, 128, 128, 0.10); border: 1px solid rgba(128, 128, 128, 0.22); border-radius: 10px; padding: 6px; outline: 0; }"
+            "QListWidget#settingsSidebar::item { padding: 10px 12px; border-radius: 7px; margin: 2px 0; }"
+            "QListWidget#settingsSidebar::item:selected { background: rgba(255, 255, 255, 0.55); font-weight: 600; }"
+            "QStackedWidget#settingsStack { background: transparent; border: none; }"
             "QFrame#card { background: rgba(128, 128, 128, 0.10); border: 1px solid rgba(128, 128, 128, 0.22); border-radius: 10px; }"
             "QFrame#card QLabel { background: transparent; }"
             "QLabel#cardTitle { font-weight: 600; }"
@@ -1603,15 +1655,17 @@ public:
         setStyleSheet(QStringLiteral(
             "QDialog { background: #F7F8FA; }"
             "QLabel { color: #202329; }"
-            "QTabWidget::pane { border: 1px solid #DADDE2; border-radius: 6px; background: #F2F4F7; top: -1px; }"
+            "QListWidget#settingsSidebar { background: #EEF0F3; border: 1px solid #E3E6EB; border-radius: 10px; padding: 8px; outline: 0; }"
+            "QListWidget#settingsSidebar::item { color: #4A505A; padding: 11px 14px; border-radius: 7px; margin: 2px 0; }"
+            "QListWidget#settingsSidebar::item:hover { background: #F7F8FA; }"
+            "QListWidget#settingsSidebar::item:selected { background: #FFFFFF; color: #202329; font-weight: 600; border: 1px solid #E1E4E9; }"
+            "QStackedWidget#settingsStack { background: transparent; border: none; }"
             "QScrollArea, QScrollArea > QWidget > QWidget#page { background: transparent; border: none; }"
             "QFrame#card { background: #FFFFFF; border: 1px solid #E3E6EB; border-radius: 8px; }"
             "QFrame#card QLabel { background: transparent; }"
             "QLabel#cardTitle { color: #202329; font-weight: 600; }"
             "QLabel#cardHint { color: #7A808A; }"
             "QLabel#rowLabel { color: #4A505A; }"
-            "QTabBar::tab { color: #676D77; padding: 8px 14px; background: #EEF0F3; border: 1px solid #DADDE2; border-bottom: none; }"
-            "QTabBar::tab:selected { color: #202329; background: #F2F4F7; font-weight: 600; }"
             "QComboBox, QKeySequenceEdit, QDoubleSpinBox { min-height: 32px; padding: 0 9px; border: 1px solid #D7DAE0; border-radius: 5px; background: #FFFFFF; color: #30343A; }"
             "QComboBox:focus, QKeySequenceEdit:focus, QDoubleSpinBox:focus { border: 1px solid #356AE6; }"
             "QKeySequenceEdit:disabled, QKeySequenceEdit QLineEdit:disabled { background: #F0F2F5; color: #858B95; selection-background-color: #F0F2F5; selection-color: #858B95; }"
@@ -1642,21 +1696,39 @@ public:
         heading->setFont(heading_font);
         root->addWidget(heading);
 
-        auto* tabs = new QTabWidget;
-        tabs->setDocumentMode(false);
-        tabs->addTab(scrollable(createInputPage(shortcut, trigger, startup_enabled)), Ui::tr("输入"));
-        tabs->addTab(scrollable(createOutputPage(mode, destination, input_content, clipboard_content, paste_delay_ms)), Ui::tr("输出"));
-        tabs->addTab(scrollable(carded(createAppearancePage())), Ui::tr("外观"));
-        tabs->addTab(scrollable(carded(createTranslationPage(translation))), Ui::tr("翻译"));
-        tabs->addTab(scrollable(createSpeechPage(speech)), Ui::tr("朗读"));
-        tabs->addTab(createHotwordPage(hotwords), Ui::tr("热词"));
+        auto* body = new QHBoxLayout;
+        body->setSpacing(16);
+        auto* sidebar = new QListWidget;
+        sidebar->setObjectName(QStringLiteral("settingsSidebar"));
+        sidebar->setFixedWidth(168);
+        sidebar->setFocusPolicy(Qt::NoFocus);
+        sidebar->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        auto* stack = new QStackedWidget;
+        stack->setObjectName(QStringLiteral("settingsStack"));
+        const auto add_page = [sidebar, stack](const QString& title, QWidget* page) {
+            sidebar->addItem(title);
+            stack->addWidget(page);
+        };
+        add_page(Ui::tr("输入"),
+                 scrollable(createInputPage(shortcut, trigger, startup_enabled, mute_while_recording)));
+        add_page(Ui::tr("输出"),
+                 scrollable(createOutputPage(mode, destination, input_content, clipboard_content,
+                                             paste_delay_ms, clipboard_ttl_seconds)));
+        add_page(Ui::tr("外观"), scrollable(carded(createAppearancePage())));
+        add_page(Ui::tr("翻译"), scrollable(carded(createTranslationPage(translation))));
+        add_page(Ui::tr("朗读"), scrollable(createSpeechPage(speech)));
+        add_page(Ui::tr("热词"), createHotwordPage(hotwords));
         if (model_manager_ != nullptr) {
             models_page_ = new ModelsPage(model_manager_, initial_model_choices_);
             models_page_->setLanguages(languageCode(translation_source_), languageCode(translation_target_));
-            tabs->addTab(scrollable(models_page_), Ui::tr("模型"));
+            add_page(Ui::tr("模型"), scrollable(models_page_));
         }
-        tabs->addTab(scrollable(carded(createVadPage(values))), QStringLiteral("VAD"));
-        root->addWidget(tabs);
+        add_page(QStringLiteral("VAD"), scrollable(carded(createVadPage(values))));
+        connect(sidebar, &QListWidget::currentRowChanged, stack, &QStackedWidget::setCurrentIndex);
+        sidebar->setCurrentRow(0);
+        body->addWidget(sidebar);
+        body->addWidget(stack, 1);
+        root->addLayout(body, 1);
         for (QComboBox* combo : {content_, clipboard_content_}) {
             connect(combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
                     [this](int) { updateContentHint(); });
@@ -1693,7 +1765,9 @@ public:
             clipboard_content_->setCurrentIndex(
                 clipboard_content_->findData(static_cast<int>(ResultContent::Original)));
             trigger_->setCurrentIndex(trigger_->findData(static_cast<int>(HotkeyTrigger::Hold)));
+            if (mute_checkbox_ != nullptr) mute_checkbox_->setChecked(false);
             paste_delay_slider_->setValue(default_paste_delay_ms);
+            if (clipboard_ttl_spin_ != nullptr) clipboard_ttl_spin_->setValue(0);
             translation_enabled_checkbox_->setChecked(false);
             translation_source_->setCurrentIndex(translation_source_->findData(QStringLiteral("zh")));
             translation_target_->setCurrentIndex(translation_target_->findData(QStringLiteral("en")));
@@ -1738,6 +1812,10 @@ public:
         return paste_delay_slider_->value();
     }
 
+    int clipboardTtlSeconds() const {
+        return clipboard_ttl_spin_ != nullptr ? clipboard_ttl_spin_->value() : 0;
+    }
+
     HotkeyTrigger trigger() const {
         return static_cast<HotkeyTrigger>(trigger_->currentData().toInt());
     }
@@ -1758,12 +1836,19 @@ public:
         return startup_checkbox_ != nullptr && startup_checkbox_->isChecked();
     }
 
+    bool muteWhileRecording() const {
+        return mute_checkbox_ != nullptr && mute_checkbox_->isChecked();
+    }
+
     TranslationSettings translation() const {
         return TranslationSettings{
             .enabled = translation_enabled_checkbox_->isChecked(),
             .direction = TranslationDirection{
                 languageCode(translation_source_).toStdString(),
                 languageCode(translation_target_).toStdString()},
+            .device = translation_device_ == nullptr
+                ? ComputePolicy::Auto
+                : static_cast<ComputePolicy>(translation_device_->currentData().toInt()),
             .separator = sanitizedSeparator(translation_separator_->text()),
         };
     }
@@ -2031,9 +2116,45 @@ private:
         return layout;
     }
 
-    QWidget* createInputPage(const QString& current_shortcut, HotkeyTrigger trigger, bool startup_enabled) {
+    // Shared by the recognition and translation selectors; both use the same
+    // three policies but persist under different settings keys.
+    static QComboBox* makeComputeCombo(ComputePolicy current) {
+        auto* combo = new QComboBox;
+        combo->addItem(Ui::tr("自动（优先 GPU）"),
+                       static_cast<int>(ComputePolicy::Auto));
+        combo->addItem(Ui::tr("仅 CPU"),
+                       static_cast<int>(ComputePolicy::Cpu));
+        combo->addItem(Ui::tr("仅 GPU（不可用时加载失败）"),
+                       static_cast<int>(ComputePolicy::Gpu));
+        combo->setCurrentIndex(std::max(0, combo->findData(static_cast<int>(current))));
+        return combo;
+    }
+
+    QWidget* createInputPage(const QString& current_shortcut, HotkeyTrigger trigger,
+                             bool startup_enabled, bool mute_while_recording) {
         auto* page = new QWidget;
         auto* layout = pageLayout(page);
+
+        QVBoxLayout* compute_card = addCard(layout, Ui::tr("计算设备"),
+            Ui::tr("自动在 GPU 可用时使用 GPU，否则使用 CPU。"
+                   "更改设备后会重新加载识别模型。"));
+        compute_ = makeComputeCombo(compute_policy_);
+        addRow(compute_card, Ui::tr("识别设备"), compute_);
+        const GpuCapability gpu = detect_gpu_capability();
+        auto* detected = new QLabel;
+        if (gpu.available) {
+            const double gib = static_cast<double>(gpu.memory_total) / (1024.0 * 1024.0 * 1024.0);
+            detected->setText(Ui::tr("检测到：%1（%2，显存 %3 GB）")
+                                  .arg(QString::fromStdString(gpu_display_name(gpu)),
+                                       QString::fromStdString(gpu.backend))
+                                  .arg(gib, 0, 'f', 1));
+        } else {
+            detected->setText(Ui::tr(
+                "未检测到可用的 GPU 后端；自动和仅 GPU 都无法使用 GPU。"));
+        }
+        detected->setObjectName(QStringLiteral("cardHint"));
+        detected->setWordWrap(true);
+        compute_card->addWidget(detected);
 
         QVBoxLayout* hotkey_card = addCard(layout, Ui::tr("快捷键"));
         shortcut_preset_ = new QComboBox;
@@ -2068,12 +2189,23 @@ private:
         hotkey_card->addWidget(shortcut_error_);
 
         QVBoxLayout* trigger_card = addCard(layout, Ui::tr("触发方式"),
-            Ui::tr("切换方式下，文字输入到第二次按快捷键时光标所在的位置，最长录音 5 分钟。"));
+            Ui::tr("切换方式最长 5 分钟；实时方式会一直保持麦克风开启，直到再按一次快捷键或按 Esc。"));
         trigger_ = new QComboBox;
         trigger_->addItem(Ui::tr("按住说话：按住开始，松开结束"), static_cast<int>(HotkeyTrigger::Hold));
         trigger_->addItem(Ui::tr("按一下切换：按一下开始，再按一下结束"), static_cast<int>(HotkeyTrigger::Toggle));
+        trigger_->addItem(Ui::tr("实时模式：按一下开始，边说边输出，再按一下结束"),
+                          static_cast<int>(HotkeyTrigger::Realtime));
         trigger_->setCurrentIndex(trigger_->findData(static_cast<int>(trigger)));
         trigger_card->addWidget(trigger_);
+
+        QVBoxLayout* audio_card = addCard(layout, Ui::tr("音频"),
+            Ui::tr("实时模式持续使用麦克风监听，不会自动静音扬声器。"
+                   "按住和切换模式可按下面的选项决定是否静音。"));
+        mute_checkbox_ = new QCheckBox(Ui::tr("录音时静音系统播放"));
+        mute_checkbox_->setChecked(mute_while_recording);
+        mute_checkbox_->setToolTip(Ui::tr(
+            "外放时开启可以减少回声；戴耳机或实时模式下建议关闭。"));
+        audio_card->addWidget(mute_checkbox_);
 
         QVBoxLayout* startup_card = addCard(layout, Ui::tr("启动"));
         startup_checkbox_ = new QCheckBox(Ui::tr("开机自动启动"));
@@ -2116,7 +2248,8 @@ private:
                               ResultDestination destination,
                               ResultContent input_content,
                               ResultContent clipboard_content,
-                              int paste_delay_ms) {
+                              int paste_delay_ms,
+                              int clipboard_ttl_seconds) {
         auto* page = new QWidget;
         auto* layout = pageLayout(page);
 
@@ -2159,8 +2292,18 @@ private:
         content_->setToolTip(Ui::tr("识别完成后浮窗上显示的文字，只给自己看。"));
         addRow(result_card, Ui::tr("浮窗内容"), content_);
         clipboard_content_ = content_combo(clipboard_content);
-        clipboard_content_->setToolTip(Ui::tr("放进剪贴板的文字；输入到光标位置的也是这一段。"));
+        clipboard_content_->setToolTip(Ui::tr(
+            "放进剪贴板的文字；输入到光标位置的也是这一段。"
+            "实时模式除外：剪贴板始终保存最近一句译文。"));
         addRow(result_card, Ui::tr("剪贴板内容"), clipboard_content_);
+        clipboard_ttl_spin_ = new QSpinBox;
+        clipboard_ttl_spin_->setRange(0, 600);
+        clipboard_ttl_spin_->setSuffix(Ui::tr(" 秒"));
+        clipboard_ttl_spin_->setSpecialValueText(Ui::tr("不自动清除"));
+        clipboard_ttl_spin_->setValue(clipboard_ttl_seconds);
+        clipboard_ttl_spin_->setToolTip(Ui::tr(
+            "最后一次写入剪贴板后，超过这段时间自动清除。实时模式每句译文都会重新计时。"));
+        addRow(result_card, Ui::tr("剪贴板保留"), clipboard_ttl_spin_);
         content_hint_ = new QLabel(Ui::tr("需要在「翻译」页开启翻译模式，否则会输出原文。"));
         content_hint_->setWordWrap(true);
         content_hint_->setStyleSheet(QStringLiteral("color: #C77A14;"));
@@ -2225,6 +2368,17 @@ private:
         add_heading(Ui::tr("翻译成"));
         translation_target_ = make_language_combo(translation.direction.target);
         layout->addWidget(translation_target_);
+
+        add_heading(Ui::tr("翻译设备"));
+        translation_device_ = makeComputeCombo(translation.device);
+        layout->addWidget(translation_device_);
+        auto* device_hint = new QLabel(Ui::tr(
+            "中英互译在 GPU 上使用 Opus-MT CUDA，其他语言使用 Qwen；"
+            "翻译设备与识别设备分开，更改后只重新加载翻译模型。"));
+        device_hint->setWordWrap(true);
+        device_hint->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
+        layout->addWidget(device_hint);
+
         const auto languages_changed = [this] {
             if (models_page_ != nullptr) {
                 models_page_->setLanguages(languageCode(translation_source_), languageCode(translation_target_));
@@ -2517,11 +2671,16 @@ private:
     QSlider* threshold_slider_ = nullptr;
     QSlider* minimum_db_slider_ = nullptr;
     QSlider* snr_slider_ = nullptr;
+    ComputePolicy compute_policy_ = ComputePolicy::Auto;
+    ComputePolicy translation_compute_policy_ = ComputePolicy::Auto;
+    QComboBox* compute_ = nullptr;
+    QComboBox* translation_device_ = nullptr;
     QComboBox* shortcut_preset_ = nullptr;
     QKeySequenceEdit* shortcut_edit_ = nullptr;
     QWidget* shortcut_edit_row_ = nullptr;
     QLabel* shortcut_error_ = nullptr;
     QCheckBox* startup_checkbox_ = nullptr;
+    QCheckBox* mute_checkbox_ = nullptr;
     QButtonGroup* mode_group_ = nullptr;
     QPushButton* raw_mode_button_ = nullptr;
     QPushButton* clean_mode_button_ = nullptr;
@@ -2531,6 +2690,7 @@ private:
     QLabel* content_hint_ = nullptr;
     QComboBox* trigger_ = nullptr;
     QSlider* paste_delay_slider_ = nullptr;
+    QSpinBox* clipboard_ttl_spin_ = nullptr;
     QTableWidget* hotword_table_ = nullptr;
     QCheckBox* translation_enabled_checkbox_ = nullptr;
     QComboBox* translation_source_ = nullptr;
@@ -2547,6 +2707,8 @@ public:
     [[nodiscard]] ModelChoices modelChoices() const {
         return models_page_ != nullptr ? models_page_->choices() : initial_model_choices_;
     }
+
+    [[nodiscard]] ComputePolicy computePolicy() const { return compute_policy_; }
 
 private:
     QLineEdit* translation_separator_ = nullptr;
@@ -2598,7 +2760,7 @@ public:
         resize(bubble_minimum_width + window_margin * 2,
                bubble_minimum_height + 48 + control_spacing + window_margin * 2);
         setFocusPolicy(Qt::NoFocus);
-        model_manager_ = new ModelManager(QDir(dataDirectory()).filePath(QStringLiteral("models")), this);
+        model_manager_ = new ModelManager(packagedModelsDirectory(), this);
         model_manager_->addFinishedHandler([this](const QString&, bool ok, const QString&) {
             if (ok) applyModelChoices();
         });
@@ -2612,6 +2774,14 @@ public:
 
         translation_deadline_.setSingleShot(true);
         connect(&translation_deadline_, &QTimer::timeout, this, [this] { completeTranslation(true); });
+        clipboard_clear_timer_.setSingleShot(true);
+        connect(&clipboard_clear_timer_, &QTimer::timeout, this, [this] {
+            if (!clipboard_owned_text_.isEmpty() &&
+                QApplication::clipboard()->text() == clipboard_owned_text_) {
+                QApplication::clipboard()->clear();
+            }
+            clipboard_owned_text_.clear();
+        });
         if (!preview_mode_) createTranslationWorker();
         if (!preview_mode_) createSpeechQueue();
         updateTranslationUi();
@@ -2772,9 +2942,9 @@ protected:
         QAction* exit_action = menu.addAction(Ui::tr("退出"));
         QAction* selected = menu.exec(event->globalPos());
         if (selected == settings_action) openSettings();
-        else if (selected == cancel_action) stopSession(false);
+        else if (selected == cancel_action) cancelTake();
         else if (selected == copy_action) {
-            QApplication::clipboard()->setText(currentTranscript().trimmed());
+            writeClipboard(currentTranscript().trimmed());
             setTransientStatus(Ui::tr("已复制当前文字"));
         }
         else if (selected == exit_action) close();
@@ -2782,7 +2952,7 @@ protected:
 
     void keyPressEvent(QKeyEvent* event) override {
         if (event->key() == Qt::Key_Escape && state_ == State::Listening) {
-            stopSession(false);
+            cancelTake();
             event->accept();
             return;
         }
@@ -2993,7 +3163,7 @@ private:
             QAction* action = menu->addAction(label);
             action->setToolTip(entry);
             connect(action, &QAction::triggered, this, [this, entry] {
-                QApplication::clipboard()->setText(entry);
+                writeClipboard(entry);
                 setTransientStatus(Ui::tr("已复制最近输入"));
             });
         }
@@ -3059,6 +3229,9 @@ private:
 
     void loadSettings() {
         loadModelChoices();
+        compute_policy_ = parse_compute_policy(settings_.value(
+            QString::fromLatin1(compute_policy_settings_key),
+            QStringLiteral("auto")).toString().toStdString()).value_or(ComputePolicy::Auto);
         vad_settings_.endpoint_ms =
             settings_.value(QStringLiteral("vad/endpoint_ms"), default_endpoint_ms).toInt();
         vad_settings_.threshold_percent = settings_.value(QStringLiteral("vad/threshold_percent"), 55).toInt();
@@ -3091,17 +3264,18 @@ private:
             QStringLiteral("translation/direction"), QStringLiteral("zh-en")).toString().toLatin1();
         translation_settings_.direction = parse_direction_code(direction_code_value.constData())
             .value_or(TranslationDirection::ZhToEn);
+        // Translation defaults to Auto, not to the recognition device: an
+        // existing install upgrades without silently changing where it runs.
+        translation_settings_.device = parse_compute_policy(settings_.value(
+            QString::fromLatin1(translation_compute_policy_settings_key),
+            QStringLiteral("auto")).toString().toStdString()).value_or(ComputePolicy::Auto);
         translation_settings_.separator = sanitizedSeparator(settings_.value(
             QStringLiteral("translation/separator"),
             QString::fromLatin1(default_translation_separator)).toString());
         speech_settings_.enabled = settings_.value(QStringLiteral("speech/enabled"), false).toBool();
-#ifdef __APPLE__
-        // Mac users mostly dictate on headphones or with echo cancellation, and
-        // a muted Mac looks broken; Windows keeps its original behaviour.
+        // Speakers stay audible by default. Users who rely on the virtual audio
+        // cable can turn muting on in Settings > Input > Audio or the tray menu.
         constexpr bool default_mute_while_recording = false;
-#else
-        constexpr bool default_mute_while_recording = true;
-#endif
         mute_while_recording_ = settings_.value(
             QStringLiteral("audio/mute_while_recording"), default_mute_while_recording).toBool();
         speech_settings_.device_id = settings_.value(QStringLiteral("speech/device_id")).toString();
@@ -3134,10 +3308,15 @@ private:
         clipboard_content_ = settings_.contains(QStringLiteral("output/clipboard_content"))
             ? resultContentFromName(settings_.value(QStringLiteral("output/clipboard_content")).toString())
             : result_content_;
-        hotkey_trigger_ = settings_.value(QStringLiteral("hotkey/trigger")).toString() == QStringLiteral("toggle")
-            ? HotkeyTrigger::Toggle : HotkeyTrigger::Hold;
+        const QString trigger_value =
+            settings_.value(QStringLiteral("hotkey/trigger")).toString();
+        hotkey_trigger_ = trigger_value == QStringLiteral("realtime") ? HotkeyTrigger::Realtime
+            : trigger_value == QStringLiteral("toggle") ? HotkeyTrigger::Toggle
+                                                        : HotkeyTrigger::Hold;
         paste_delay_ms_ = std::clamp(settings_.value(
             QStringLiteral("output/paste_delay_ms"), default_paste_delay_ms).toInt(), 0, maximum_paste_delay_ms);
+        clipboard_ttl_seconds_ = std::clamp(settings_.value(
+            QStringLiteral("output/clipboard_ttl_seconds"), 0).toInt(), 0, 600);
         const AppearanceSettings defaults;
         appearance_.preset = themePresetFromName(settings_.value(
             QStringLiteral("appearance/preset"), themePresetName(defaults.preset)).toString());
@@ -3225,12 +3404,19 @@ private:
 #endif
 
     QString idleHint() const {
+        if (hotkey_trigger_ == HotkeyTrigger::Realtime) {
+            return Ui::tr("按 %1 开始实时输入").arg(shortcutDisplayName(hotkey_shortcut_));
+        }
         return (hotkey_trigger_ == HotkeyTrigger::Toggle ? Ui::tr("按 %1 开始说话")
                                                         : Ui::tr("按住 %1"))
             .arg(shortcutDisplayName(hotkey_shortcut_));
     }
 
     QString listeningHint() const {
+        if (hotkey_trigger_ == HotkeyTrigger::Realtime) {
+            return Ui::tr("正在实时转写...再按 %1 结束")
+                .arg(shortcutDisplayName(hotkey_shortcut_));
+        }
         if (!toggle_active_) return Ui::tr("正在听取...");
         return Ui::tr("正在听取...再按 %1 结束").arg(shortcutDisplayName(hotkey_shortcut_));
     }
@@ -3252,6 +3438,28 @@ private:
         }
         model_choices_.translator =
             settings_.value(QStringLiteral("models/translator"), QStringLiteral("auto")).toString();
+        model_choices_.custom_directory =
+            settings_.value(QStringLiteral("models/custom_directory")).toString();
+        model_choices_.custom_paths.clear();
+        settings_.beginGroup(QStringLiteral("models/custom_paths"));
+        for (const QString& key : settings_.childKeys()) {
+            const QString path = settings_.value(key).toString();
+            if (!path.isEmpty()) model_choices_.custom_paths.insert(key, path);
+        }
+        settings_.endGroup();
+        applyModelLocations();
+    }
+
+    // Push the user's extra model locations into the manager. Used after
+    // loading settings, applying the dialog and cancelling the dialog.
+    void applyModelLocations() {
+        if (model_manager_ == nullptr) return;
+        model_manager_->setCustomDirectory(model_choices_.custom_directory);
+        model_manager_->clearCustomPaths();
+        for (auto it = model_choices_.custom_paths.begin();
+             it != model_choices_.custom_paths.end(); ++it) {
+            model_manager_->setCustomPath(it.key(), it.value());
+        }
     }
 
     void saveModelChoices() {
@@ -3262,6 +3470,14 @@ private:
             settings_.endGroup();
         }
         settings_.setValue(QStringLiteral("models/translator"), model_choices_.translator);
+        settings_.setValue(QStringLiteral("models/custom_directory"), model_choices_.custom_directory);
+        settings_.remove(QStringLiteral("models/custom_paths"));
+        settings_.beginGroup(QStringLiteral("models/custom_paths"));
+        for (auto it = model_choices_.custom_paths.begin();
+             it != model_choices_.custom_paths.end(); ++it) {
+            settings_.setValue(it.key(), it.value());
+        }
+        settings_.endGroup();
     }
 
     void saveSettings() {
@@ -3278,9 +3494,11 @@ private:
         settings_.setValue(QStringLiteral("output/content"), resultContentName(result_content_));
         settings_.setValue(QStringLiteral("output/clipboard_content"), resultContentName(clipboard_content_));
         settings_.setValue(QStringLiteral("hotkey/trigger"),
-                           hotkey_trigger_ == HotkeyTrigger::Toggle ? QStringLiteral("toggle")
-                                                                    : QStringLiteral("hold"));
+                           hotkey_trigger_ == HotkeyTrigger::Realtime ? QStringLiteral("realtime")
+                           : hotkey_trigger_ == HotkeyTrigger::Toggle ? QStringLiteral("toggle")
+                                                                      : QStringLiteral("hold"));
         settings_.setValue(QStringLiteral("output/paste_delay_ms"), paste_delay_ms_);
+        settings_.setValue(QStringLiteral("output/clipboard_ttl_seconds"), clipboard_ttl_seconds_);
         settings_.setValue(QStringLiteral("speech/enabled"), speech_settings_.enabled);
         settings_.setValue(QStringLiteral("audio/mute_while_recording"), mute_while_recording_);
         settings_.setValue(QStringLiteral("speech/device_id"), speech_settings_.device_id);
@@ -3289,6 +3507,10 @@ private:
         settings_.setValue(QStringLiteral("speech/voice_en"), speech_settings_.voice_en);
         settings_.setValue(QStringLiteral("speech/speed_percent"), speech_settings_.speed_percent);
         settings_.setValue(QStringLiteral("speech/live"), speech_settings_.live);
+        const std::string_view compute_code = compute_policy_code(compute_policy_);
+        settings_.setValue(QString::fromLatin1(compute_policy_settings_key),
+                           QString::fromLatin1(compute_code.data(),
+                                               static_cast<int>(compute_code.size())));
         settings_.sync();
     }
 
@@ -3297,6 +3519,12 @@ private:
         settings_.setValue(QStringLiteral("translation/enabled"), translation_settings_.enabled);
         settings_.setValue(QStringLiteral("translation/direction"),
                            QString::fromStdString(direction_code(translation_settings_.direction)));
+        const std::string_view translation_device_code =
+            compute_policy_code(translation_settings_.device);
+        settings_.setValue(
+            QString::fromLatin1(translation_compute_policy_settings_key),
+            QString::fromLatin1(translation_device_code.data(),
+                                static_cast<int>(translation_device_code.size())));
         settings_.setValue(QStringLiteral("translation/separator"), translation_settings_.separator);
         settings_.sync();
     }
@@ -3308,7 +3536,7 @@ private:
             return;
         }
         InputSettingsDialog dialog(
-            vad_settings_, hotkey_shortcut_, text_mode_, hotkey_trigger_, result_destination_, result_content_, clipboard_content_, paste_delay_ms_, startup_enabled_,
+            vad_settings_, compute_policy_, translation_settings_.device, hotkey_shortcut_, text_mode_, hotkey_trigger_, result_destination_, result_content_, clipboard_content_, paste_delay_ms_, clipboard_ttl_seconds_, startup_enabled_, mute_while_recording_,
             text_processor_.hotwords(), translation_settings_, speech_settings_, appearance_, bubble_style_,
             [this](const AppearanceSettings& appearance) {
                 appearance_ = appearance;
@@ -3318,8 +3546,16 @@ private:
             model_manager_, model_choices_,
             this);
         if (dialog.exec() == QDialog::Accepted) {
+            // A device change must rebuild the engine; do it after the dialog
+            // closes so no session can be holding the old one.
+            const ComputePolicy selected_compute = dialog.computePolicy();
+            const bool compute_changed = selected_compute != compute_policy_;
+            compute_policy_ = selected_compute;
             speech_settings_ = dialog.speech();
             model_choices_ = dialog.modelChoices();
+            // Translation device changes rebuild the translation worker
+            // inside applyTranslationSettings; an ASR device change below
+            // reloads only the recognition model.
             applyTranslationSettings(dialog.translation());
             vad_settings_ = dialog.values();
             text_mode_ = dialog.mode();
@@ -3336,6 +3572,9 @@ private:
 #else
             hotkey_shortcut_ = selected_shortcut;
 #endif
+            mute_while_recording_ = dialog.muteWhileRecording();
+            clipboard_ttl_seconds_ = dialog.clipboardTtlSeconds();
+            applyClipboardTtl();
             const bool requested_startup = dialog.startupEnabled();
             if (!setPlatformStartupEnabled(requested_startup)) {
                 QMessageBox::warning(
@@ -3355,9 +3594,21 @@ private:
             if (!text_processor_.save_hotwords(hotword_path, hotword_error)) {
                 QMessageBox::warning(this, Ui::tr("热词未保存"), to_qstring(hotword_error));
             }
+            if (compute_changed && !recognizerKey().isEmpty() &&
+                (state_ == State::Ready || state_ == State::Error)) {
+                if (loader_.joinable()) loader_.join();
+                state_ = State::Loading;
+                setBubbleStatus(Ui::tr("正在重新加载模型..."));
+                recording_control_->setEnabled(false);
+                beginLoadModels();
+            }
             setTransientStatus(Ui::tr("已应用：%1")
                                    .arg(shortcutDisplayName(hotkey_shortcut_)));
             QTimer::singleShot(1600, this, [this] { hidePopup(); });
+        } else {
+            // The models page applies imports to the manager immediately so it
+            // can show their status. Cancelling must restore the saved choices.
+            applyModelLocations();
         }
     }
 
@@ -3657,7 +3908,9 @@ private:
     }
 
     void handleHotkeyPressed() {
-        if (hotkey_trigger_ == HotkeyTrigger::Toggle) {
+        // Realtime is a start/stop latch like toggle; only delivery differs.
+        if (hotkey_trigger_ == HotkeyTrigger::Toggle ||
+            hotkey_trigger_ == HotkeyTrigger::Realtime) {
             handleTogglePress();
             return;
         }
@@ -3700,7 +3953,11 @@ private:
         startSession(true);
         if (state_ == State::Listening) {
             toggle_active_ = true;
-            toggle_limit_timer_.start(toggle_session_limit_ms);
+            // Realtime stays open until the user presses the shortcut again.
+            // Toggle keeps its five-minute safety limit.
+            if (hotkey_trigger_ != HotkeyTrigger::Realtime) {
+                toggle_limit_timer_.start(toggle_session_limit_ms);
+            }
             setBubbleStatus(listeningHint());
         }
     }
@@ -3803,6 +4060,7 @@ private:
 
     // Re-resolves every model after a language, choice or download change.
     void applyModelChoices() {
+        applyModelLocations();
         saveModelChoices();
         if ((state_ == State::Ready || state_ == State::Error) && recognizerKey() != loaded_recognizer_ &&
             !recognizerKey().isEmpty()) {
@@ -3853,7 +4111,8 @@ private:
         }
         const std::string whisper_language = language.toStdString();
         const bool load_base = !base_models_loaded_;
-        loader_ = std::thread([this, candidates, whisper_language, load_base] {
+        const ComputePolicy compute = compute_policy_;
+        loader_ = std::thread([this, candidates, whisper_language, load_base, compute] {
             const std::filesystem::path directory =
                 dataDirectory().toStdWString();
             std::string error;
@@ -3864,10 +4123,14 @@ private:
                 std::unique_ptr<SpeechEngine> engine;
                 if (candidate.engine == ModelEngine::Whisper) {
                     auto whisper = std::make_unique<WhisperEngine>();
-                    if (whisper->load(candidate.path, whisper_language, 8, attempt_error)) engine = std::move(whisper);
+                    if (whisper->load(candidate.path, whisper_language, 8, attempt_error, compute)) {
+                        engine = std::move(whisper);
+                    }
                 } else {
                     auto sensevoice = std::make_unique<SenseVoiceEngine>();
-                    if (sensevoice->load(candidate.path, 8, attempt_error)) engine = std::move(sensevoice);
+                    if (sensevoice->load(candidate.path, 8, attempt_error, compute)) {
+                        engine = std::move(sensevoice);
+                    }
                 }
                 if (engine != nullptr) {
                     // Hold recognition to the language the user speaks.
@@ -3884,7 +4147,10 @@ private:
             }
             if (success) error.clear();
             if (success && load_base) {
-                success = vad_.load(directory / L"models" / L"fsmn-vad.gguf", 8, error);
+                // VAD overlaps with ASR (8 threads) now, so give the small
+                // VAD model half the pool instead of oversubscribing the CPU.
+                success = vad_.load(
+                    packagedModelPath("fsmn-vad.gguf", ModelKind::Recognizer), 4, error);
                 const std::filesystem::path hotwords = hotwordsPath(false);
                 if (success && std::filesystem::exists(hotwords)) {
                     success = text_processor_.load_hotwords(hotwords, error);
@@ -3897,7 +4163,7 @@ private:
                 }
             }
             if (shutting_down_.load(std::memory_order_acquire)) return;
-            QMetaObject::invokeMethod(this, [this, success, error, loaded_key, load_base] {
+            QMetaObject::invokeMethod(this, [this, success, error, loaded_key, load_base, compute] {
                 if (success) {
                     if (load_base) base_models_loaded_ = true;
                     loaded_recognizer_ = loaded_key;
@@ -3912,12 +4178,18 @@ private:
                     if (translation_settings_.enabled) requestTranslationModel();
                 } else {
                     state_ = State::Error;
+                    // Never keep the previous engine when the user required a
+                    // GPU: it would silently keep recognizing on the CPU.
+                    if (compute == ComputePolicy::Gpu) engine_.reset();
                     loaded_recognizer_.clear();
                     setBubbleStatus(Ui::tr("模型加载失败"));
                     recording_control_->setToolTip(to_qstring(error));
                     // A missing model is fixed by downloading it; let the user
                     // reach Settings without restarting.
-                    if (!load_base || base_models_loaded_) state_ = State::Ready;
+                    if (compute != ComputePolicy::Gpu &&
+                        (!load_base || base_models_loaded_)) {
+                        state_ = State::Ready;
+                    }
                 }
             }, Qt::QueuedConnection);
         });
@@ -3937,7 +4209,15 @@ private:
         stop_should_commit_ = false;
         translation_tickets_.clear();
         awaiting_translation_ = false;
-        live_speaking_ = speech_settings_.live && speechActive() && voice_model_ != nullptr;
+        streaming_output_ = hotkey_trigger_ == HotkeyTrigger::Realtime && via_hotkey;
+        streaming_next_sentence_ = 0;
+        streaming_source_chars_ = 0;
+        streaming_output_text_.clear();
+        streaming_fallback_used_ = false;
+        streaming_fallback_notified_ = false;
+        streaming_delivered_any_ = false;
+        live_speaking_ = (speech_settings_.live || streaming_output_) &&
+            speechActive() && voice_model_ != nullptr;
         live_next_sentence_ = 0;
         if (translation_settings_.enabled) {
             translation_session_.emplace(translation_settings_.direction);
@@ -3960,10 +4240,12 @@ private:
                 .partial_interval_ms = 450,
                 .minimum_audio_ms = 600,
                 .minimum_new_audio_ms = 240,
-                // Live speaking needs sentences to close sooner; the translator
-                // gets the earlier sentences as context, so splits cost little.
-                .endpoint_silence_ms = live_speaking_ ? std::min(vad_settings_.endpoint_ms, 800)
-                                                      : vad_settings_.endpoint_ms,
+                // Realtime forwards a sentence after one second of silence.
+                // Live speaking also closes sentences sooner so the other side
+                // hears them while the user keeps talking.
+                .endpoint_silence_ms = streaming_output_ ? 1'000
+                    : live_speaking_ ? std::min(vad_settings_.endpoint_ms, 800)
+                                     : vad_settings_.endpoint_ms,
                 .maximum_utterance_ms = 15'000,
                 .memory_limit_mb = 300,
                 .vad_speech_threshold = vad_settings_.threshold_percent / 100.0F,
@@ -3977,7 +4259,10 @@ private:
             },
             &text_processor_);
         std::string playback_mute_error;
-        if (mute_while_recording_ && !playback_mute_.mute(playback_mute_error)) {
+        // Realtime is an open microphone: keep the speakers audible. The
+        // hold/toggle modes follow the user's setting.
+        if (mute_while_recording_ && !streaming_output_ &&
+            !playback_mute_.mute(playback_mute_error)) {
             recording_control_->setToolTip(Ui::tr("无法暂时静音系统播放：%1")
                                                .arg(to_qstring(playback_mute_error)));
         }
@@ -3994,6 +4279,17 @@ private:
             recognizer_.reset();
             playback_mute_.restore();
             microphone_.reset();
+            // The take never started: drop everything a later session could
+            // otherwise inherit from this attempt.
+            streaming_output_ = false;
+            streaming_output_text_.clear();
+            streaming_next_sentence_ = 0;
+            streaming_source_chars_ = 0;
+            streaming_fallback_used_ = false;
+            streaming_fallback_notified_ = false;
+            streaming_delivered_any_ = false;
+            live_speaking_ = false;
+            live_next_sentence_ = 0;
             state_ = State::Ready;
             recording_control_->setListening(false);
             recording_control_->setEnabled(true);
@@ -4020,6 +4316,8 @@ private:
     // live mode already queued is dropped.
     void cancelTake() {
         live_speaking_ = false;
+        // Stop any further realtime sentence delivery; text already typed stays.
+        streaming_output_ = false;
         if (speech_queue_ != nullptr) speech_queue_->clear();
         if (state_ == State::Listening) {
             stopSession(false);
@@ -4068,7 +4366,14 @@ private:
         if (state_ != State::Listening || microphone_ == nullptr || recognizer_ == nullptr) return;
         state_ = State::Stopping;
         stop_should_commit_ = commit;
-        if (!commit) inject_on_complete_ = false;
+        if (!commit) {
+            inject_on_complete_ = false;
+            // Cancel: a late translation must never deliver another sentence,
+            // and speech already queued is dropped. Text delivered so far stays.
+            live_speaking_ = false;
+            streaming_output_ = false;
+            if (speech_queue_ != nullptr) speech_queue_->clear();
+        }
         toggle_active_ = false;
         toggle_limit_timer_.stop();
 #ifdef SENSEVOICE_NATIVE_INPUT
@@ -4099,6 +4404,18 @@ private:
         microphone_.reset();
         recognizer_.reset();
         partial_text_.clear();
+        const bool streamed = streaming_output_;
+        if (commit && streamed && !translation_session_.has_value()) {
+            // A final result can arrive between the stop press and finish;
+            // deliver only the tail that was not streamed yet.
+            QString tail = committed_text_.mid(streaming_source_chars_).trimmed();
+            if (!tail.isEmpty()) {
+                if (text_mode_ == TextMode::Clean) tail = polished(tail);
+                const QString fragment = appendStreamingPiece(tail.trimmed());
+                if (!fragment.isEmpty()) deliverStreamingText(fragment, tail);
+                streaming_source_chars_ = committed_text_.size();
+            }
+        }
         if (commit && translation_session_.has_value() && !translation_session_->empty()) {
             beginTranslationWait();
             return;
@@ -4107,16 +4424,21 @@ private:
         translation_tickets_.clear();
 
         QString final_text = committed_text_.trimmed();
-        if (commit && !final_text.isEmpty() && text_mode_ == TextMode::Clean) {
+        // Realtime polished each sentence before delivering it; polishing the
+        // whole text again would change what was already typed.
+        if (commit && !streamed && !final_text.isEmpty() && text_mode_ == TextMode::Clean) {
             final_text = polished(final_text);
         }
-        finishSession(commit, final_text, final_text, {}, {});
+        finishSession(commit, final_text, final_text, {}, {}, streamed);
+        streaming_output_ = false;
     }
 
     // final_text: what Insert types (bilingual when translated). translation is
     // empty when translation was off or fell back. notice: orange fallback hint.
+    // streamed: realtime already delivered each sentence, so nothing is injected
+    // or spoken as a whole here.
     void finishSession(bool commit, QString final_text, const QString& original,
-                       const QString& translation, QString notice) {
+                       const QString& translation, QString notice, bool streamed = false) {
         const std::uint64_t session_id = session_generation_;
         const bool copy_only = result_destination_ == ResultDestination::CopyOnly;
         const auto text_for = [&](ResultContent content) {
@@ -4125,6 +4447,10 @@ private:
         };
         const QString bubble_text = text_for(result_content_);
         const QString clipboard_text = text_for(clipboard_content_);
+        // Realtime already delivered sentence by sentence; the accumulated
+        // text is the only exact record of what went into the target, so
+        // clipboard and history must reuse it rather than recompute.
+        const QString delivered_text = streamed ? streaming_output_text_ : clipboard_text;
         const QString& input_text = clipboard_text;
         const bool wants_translation = clipboard_content_ != ResultContent::Original ||
             result_content_ != ResultContent::Original;
@@ -4137,7 +4463,7 @@ private:
         // 朗读 never falls back to the 原文: no 译文, nothing is spoken.
         if (live_speaking_ && commit) {
             // Live mode already spoke each sentence as it was translated.
-        } else if (commit && !final_text.isEmpty() && speechActive()) {
+        } else if (!streamed && commit && !final_text.isEmpty() && speechActive()) {
             if (translation.isEmpty()) {
                 notice = notice.isEmpty() ? Ui::tr("没有译文，未朗读")
                                           : notice + Ui::tr("，未朗读");
@@ -4148,10 +4474,12 @@ private:
         const QString output_text = bubble_text;
         if (!commit) {
             committed_text_.clear();
-        } else if (!final_text.isEmpty()) {
+        } else if (streamed ? !delivered_text.isEmpty() : !final_text.isEmpty()) {
             committed_text_ = output_text;
-            QApplication::clipboard()->setText(clipboard_text);
-            recordHistory(clipboard_text);
+            // Realtime already copied each sentence as it settled. Do not
+            // replace the latest translation with the whole session here.
+            if (!streamed) writeClipboard(delivered_text);
+            recordHistory(delivered_text);
             std::string hotword_error;
             const std::filesystem::path hotword_path =
                 hotwordsPath(true);
@@ -4180,6 +4508,19 @@ private:
 #endif
             setTransientStatus(Ui::tr("未识别到"));
             QTimer::singleShot(500, this, [this] { hidePopup(); });
+        } else if (streamed) {
+            // Realtime already injected or copied every sentence; only report.
+#ifdef SENSEVOICE_NATIVE_INPUT
+            target_ = {};
+            inject_on_complete_ = false;
+#endif
+            refreshTranscript();
+            const bool copied =
+                copy_only || streaming_fallback_used_ || !streaming_delivered_any_;
+            recording_control_->setToolTip(copied ? Ui::tr("已复制到剪贴板")
+                                                  : Ui::tr("已输入到光标位置"));
+            if (!notice.isEmpty()) showTranslationNotice(output_text, notice);
+            else scheduleLingerHide(session_id);
         } else {
 #ifdef SENSEVOICE_NATIVE_INPUT
             TextInputTarget target = std::move(target_);
@@ -4244,8 +4585,29 @@ private:
         const QString value = to_qstring(event.text).trimmed();
         if (event.kind == RecognitionEventKind::Final) {
             if (!value.isEmpty()) {
-                if (translation_session_.has_value()) submitForTranslation(value);
-                else committed_text_ += value;
+                if (streaming_output_ && state_ == State::Listening) {
+                    if (translation_session_.has_value()) {
+                        submitForTranslation(value);
+                        flushStreamingDeliveries();
+                    } else {
+                        // Translation off: output each settled sentence right away.
+                        const QString organised =
+                            text_mode_ == TextMode::Clean ? polished(value) : value;
+                        committed_text_ += organised;
+                        const QString fragment = appendStreamingPiece(organised.trimmed());
+                        if (!fragment.isEmpty()) {
+                            deliverStreamingText(fragment, organised);
+                            // The forwarded sentence leaves the bubble; a new
+                            // partial starts the next one from empty.
+                            partial_text_.clear();
+                        }
+                        streaming_source_chars_ = committed_text_.size();
+                    }
+                } else if (translation_session_.has_value()) {
+                    submitForTranslation(value);
+                } else {
+                    committed_text_ += value;
+                }
             }
             partial_text_.clear();
         } else {
@@ -4261,32 +4623,32 @@ private:
     }
 
     void createTranslationWorker() {
-        const std::filesystem::path models =
-            std::filesystem::path(dataDirectory().toStdWString()) / L"models";
-        (void)models;
+        const std::filesystem::path models = packagedTranslationModelsDirectory();
+        // Translation has its own device policy. CPU selects Opus-MT for
+        // zh-en/en-zh (Qwen for other directions); GPU selects Opus-MT CUDA
+        // for zh-en/en-zh when compiled and Qwen for everything else, and
+        // fails instead of pretending a CPU run is a GPU run. The capability
+        // sample is taken here, on the UI thread, before the worker starts.
+        const ComputePolicy compute = translation_settings_.device;
         translation_worker_ = std::make_unique<TranslationWorker>(
+            make_translation_factory(
+                models,
+                [this] {
 #ifdef SENSEVOICE_WITH_LLM_TRANSLATION
-            // The model file is whichever translator the user picked; it is
-            // read when a direction loads, on the worker thread.
-            [this](TranslationDirection direction, std::string& error) -> std::unique_ptr<Translator> {
-                std::filesystem::path path;
-                {
+                    // The model file is whichever translator the user picked;
+                    // it is read on the worker thread when a direction loads.
                     std::lock_guard lock(translator_mutex_);
-                    path = translator_path_;
-                }
-                if (path.empty()) {
-                    error = "no translation model installed; download one in Settings > Models";
-                    return nullptr;
-                }
-                return make_llm_translation_factory(path, 4)(direction, error);
-            },
+                    return translator_path_;
 #else
-            make_default_translation_factory(models, 4),
+                    return std::filesystem::path();
 #endif
-            [this](TranslationDirection direction, bool ok, const std::string& error) {
+                },
+                4, compute, detect_gpu_capability()),
+            [this](TranslationDirection direction, bool ok, const std::string& error,
+                   const TranslationModelInfo& info) {
                 if (shutting_down_.load(std::memory_order_acquire)) return;
-                QMetaObject::invokeMethod(this, [this, direction, ok, error] {
-                    translationModelLoaded(direction, ok, error);
+                QMetaObject::invokeMethod(this, [this, direction, ok, error, info] {
+                    translationModelLoaded(direction, ok, error, info);
                 }, Qt::QueuedConnection);
             },
             [this](std::uint64_t ticket, std::optional<std::string> translation, const std::string&) {
@@ -4297,17 +4659,41 @@ private:
             });
     }
 
+    // The policy is captured by the worker at creation, so a change needs a
+    // fresh worker. Only called with no session listening or stopping.
+    void recreateTranslationWorker() {
+        if (preview_mode_) return;
+        if (state_ == State::Listening || state_ == State::Stopping) return;
+        if (translation_worker_) {
+            translation_worker_->unload();
+            translation_worker_.reset();
+        }
+        translation_ready_direction_.reset();
+        translation_loading_ = false;
+        translation_backend_.clear();
+        translation_device_.clear();
+        translation_tickets_.clear();
+        createTranslationWorker();
+        if (translation_settings_.enabled) requestTranslationModel();
+        updateTranslationUi();
+    }
+
     // Single place that changes the translation mode, so the floating control,
     // tray menu, settings dialog and persisted values never disagree.
     void applyTranslationSettings(const TranslationSettings& requested) {
         const bool locked = state_ == State::Listening || state_ == State::Stopping;
         if (!locked) {
+            const bool device_changed = requested.device != translation_settings_.device;
             const bool model_changed = requested.enabled != translation_settings_.enabled ||
                 requested.direction != translation_settings_.direction;
             translation_settings_ = requested;
             translation_settings_.separator = sanitizedSeparator(requested.separator);
             saveTranslationSettings();
-            if (model_changed) {
+            if (device_changed) {
+                // The worker captured the old device. Rebuild only the
+                // translation worker; recognition is untouched.
+                recreateTranslationWorker();
+            } else if (model_changed) {
                 if (!translation_settings_.enabled) {
                     translation_loading_ = false;
                     translation_ready_direction_.reset();
@@ -4343,14 +4729,20 @@ private:
         updateTranslationUi();
     }
 
-    void translationModelLoaded(TranslationDirection direction, bool ok, const std::string& error) {
+    void translationModelLoaded(
+        TranslationDirection direction, bool ok, const std::string& error,
+        const TranslationModelInfo& info) {
         // A newer request superseded this one; its own result will follow.
         if (!translation_settings_.enabled || direction != translation_settings_.direction) return;
         translation_loading_ = false;
         if (ok) {
             translation_ready_direction_ = direction;
+            translation_backend_ = to_qstring(info.backend);
+            translation_device_ = to_qstring(info.device);
         } else {
             translation_ready_direction_.reset();
+            translation_backend_.clear();
+            translation_device_.clear();
             translation_settings_.enabled = false;
             saveTranslationSettings();
             if (translation_worker_) translation_worker_->unload();
@@ -4366,10 +4758,22 @@ private:
             }
         }
         updateTranslationUi();
+        if (ok && isVisible()) {
+            setTransientStatus(Ui::tr("翻译：%1 · %2")
+                                   .arg(translation_backend_, translation_device_));
+        }
     }
 
     void updateTranslationUi() {
         const bool locked = state_ == State::Listening || state_ == State::Stopping;
+        if (tray_icon_ != nullptr) {
+            QString tooltip = QStringLiteral("SenseVoice 语音输入");
+            if (translation_settings_.enabled && !translation_backend_.isEmpty()) {
+                tooltip += QStringLiteral("\n%1 · %2")
+                               .arg(translation_backend_, translation_device_);
+            }
+            tray_icon_->setToolTip(tooltip);
+        }
         recording_control_->setTranslationState(
             translation_settings_.enabled, translation_settings_.direction,
             translation_loading_, locked);
@@ -4423,6 +4827,105 @@ private:
         translation_worker_->translate(ticket, utf8, translationHints());
     }
 
+    // Realtime delivery: a settled sentence is injected (or copied) as soon as
+    // it is ready. A dead target degrades to the clipboard without ending the
+    // session, and the notice is shown only once.
+    void deliverStreamingText(const QString& fragment, const QString& clipboard_text) {
+        // The fragment is exactly what appendStreamingPiece added, including
+        // any joining space, so typed text and streaming_output_text_ agree.
+        // clipboard_text is just the latest sentence, never the whole session.
+        if (fragment.isEmpty()) return;
+        const QString latest = clipboard_text.trimmed().isEmpty()
+            ? fragment.trimmed() : clipboard_text.trimmed();
+#ifdef SENSEVOICE_NATIVE_INPUT
+        if (result_destination_ == ResultDestination::Insert) {
+            bool paste_safe = false;
+            if (injectIntoTarget(target_, fragment, &paste_safe)) {
+                writeClipboard(latest);
+                streaming_delivered_any_ = true;
+                return;
+            }
+            streaming_fallback_used_ = true;
+            writeClipboard(latest);
+            if (!streaming_fallback_notified_) {
+                streaming_fallback_notified_ = true;
+                recording_control_->setToolTip(Ui::tr("注入失败，已复制到剪贴板"));
+            }
+            streaming_delivered_any_ = true;
+            return;
+        }
+#endif
+        writeClipboard(latest);
+        streaming_delivered_any_ = true;
+    }
+
+    // One sentence's share of the final text, using the same content policy as
+    // normal insertion (clipboard_content_): Original keeps the original,
+    // Translation falls back to the original, Both appends the translation.
+    [[nodiscard]] QString streamingPiece(const QString& original, const QString& translation) const {
+        const bool translated = !translation.isEmpty();
+        switch (clipboard_content_) {
+        case ResultContent::Original:
+            break;
+        case ResultContent::Translation:
+            if (translated) return translation;
+            break;
+        case ResultContent::Both:
+            if (translated) return original + translation_settings_.separator + translation;
+            break;
+        }
+        return original;
+    }
+
+    // Append a settled sentence to the accumulated realtime text and return the
+    // exact fragment to deliver. Joining matches join_sentences: a single space
+    // only when both adjacent edges are ASCII.
+    [[nodiscard]] QString appendStreamingPiece(const QString& piece) {
+        if (piece.isEmpty()) return {};
+        QString fragment = piece;
+        if (!streaming_output_text_.isEmpty()) {
+            const QString& accumulated = streaming_output_text_;
+            const QChar last = accumulated.back();
+            const QChar first = piece.front();
+            if (last.unicode() < 0x80 && first.unicode() < 0x80) {
+                fragment.prepend(QLatin1Char(' '));
+            }
+        }
+        streaming_output_text_ += fragment;
+        return fragment;
+    }
+
+    // Deliver settled sentences strictly in order; the first pending sentence
+    // blocks later ones so text never arrives out of order.
+    void flushStreamingDeliveries(bool include_pending = false) {
+        if (!streaming_output_ || !translation_session_.has_value()) return;
+        bool delivered = false;
+        while (streaming_next_sentence_ < translation_session_->size()) {
+            const std::size_t index = streaming_next_sentence_;
+            const SentenceTranslationState state = translation_session_->state(index);
+            if (state == SentenceTranslationState::Pending && !include_pending) break;
+            const QString original = to_qstring(translation_session_->original(index));
+            const QString translation = state == SentenceTranslationState::Translated
+                ? to_qstring(translation_session_->translation(index))
+                : QString{};
+            const QString piece = streamingPiece(original, translation).trimmed();
+            if (!piece.isEmpty()) {
+                const QString fragment = appendStreamingPiece(piece);
+                if (!fragment.isEmpty()) {
+                    // The clipboard always receives the latest sentence's
+                    // translation, or its original when no translation exists.
+                    const QString latest = (translation.isEmpty() ? original : translation).trimmed();
+                    deliverStreamingText(fragment, latest);
+                    delivered = true;
+                }
+            }
+            ++streaming_next_sentence_;
+        }
+        // Forwarded sentences disappear from the bubble so the next utterance
+        // starts with a clean display.
+        if (delivered && state_ == State::Listening) partial_text_.clear();
+    }
+
     // Live speaking: say each sentence as soon as it and every sentence before
     // it are settled, while the user keeps talking. Esc still discards what
     // hasn't been played yet.
@@ -4447,6 +4950,8 @@ private:
         if (translation.has_value()) translation_session_->set_translation(pending.index, *translation);
         else translation_session_->set_failed(pending.index);
         speakLiveSentences();
+        // Realtime keeps delivering while the session is running or winding down.
+        flushStreamingDeliveries();
 
         if (awaiting_translation_) {
             if (!translation_session_->has_pending()) completeTranslation(false);
@@ -4498,9 +5003,29 @@ private:
             notice = Ui::tr("翻译超时，已输入原文");
             break;
         }
+        // Deliver whatever settled after the stop press, in order. On timeout
+        // the still-pending sentences fall back to their originals.
+        flushStreamingDeliveries(timed_out);
+        const bool streamed = streaming_output_;
+        if (streamed) {
+            bool any_translated = false;
+            bool any_untranslated = false;
+            for (std::size_t index = 0; index < translation_session_->size(); ++index) {
+                if (translation_session_->state(index) == SentenceTranslationState::Translated) {
+                    any_translated = true;
+                } else {
+                    any_untranslated = true;
+                }
+            }
+            // Only part of the take fell back; do not claim all of it did.
+            if (any_translated && any_untranslated) {
+                notice = Ui::tr("部分句子未翻译，已输入原文");
+            }
+        }
         translation_session_.reset();
         translation_tickets_.clear();
-        finishSession(true, to_qstring(injection.text), original, translation, notice);
+        finishSession(true, to_qstring(injection.text), original, translation, notice, streamed);
+        streaming_output_ = false;
     }
 
     void createSpeechQueue() {
@@ -4513,7 +5038,8 @@ private:
                 QStringLiteral("sensevoice-tts")
 #endif
                 ),
-            QDir(dataDirectory()).filePath(QStringLiteral("models/kokoro-multi-lang-v1_1")),
+            QString::fromStdWString(
+                packagedModelPath("kokoro-multi-lang-v1_1", ModelKind::Voice).wstring()),
             [this](const QString& message) {
                 if (shutting_down_.load(std::memory_order_acquire)) return;
                 showSpeechNotice(message);
@@ -4595,6 +5121,26 @@ private:
         });
     }
 
+    // Every clipboard write made by the app goes through here so the optional
+    // retention timer can clear it later. Text the user copies from elsewhere
+    // is never touched.
+    void writeClipboard(const QString& text) {
+        if (text.isEmpty()) return;
+        QApplication::clipboard()->setText(text);
+        clipboard_owned_text_ = text;
+        clipboard_clear_timer_.stop();
+        if (clipboard_ttl_seconds_ > 0) {
+            clipboard_clear_timer_.start(clipboard_ttl_seconds_ * 1000);
+        }
+    }
+
+    void applyClipboardTtl() {
+        clipboard_clear_timer_.stop();
+        if (clipboard_ttl_seconds_ > 0 && !clipboard_owned_text_.isEmpty()) {
+            clipboard_clear_timer_.start(clipboard_ttl_seconds_ * 1000);
+        }
+    }
+
     void setTransientStatus(const QString& text) {
         setBubbleStatus(text);
         status_reset_timer_.stop();
@@ -4614,8 +5160,10 @@ private:
                 : idleHint());
             return;
         }
-        // Partials stay monolingual; translations of finished sentences show beneath.
-        const QString translated = translation_session_.has_value()
+        // Partials stay monolingual; translations of finished sentences show
+        // beneath. Realtime keeps only the sentence being spoken in the bubble,
+        // so nothing from the previous sentence remains after forwarding.
+        const QString translated = translation_session_.has_value() && !streaming_output_
             ? to_qstring(translation_session_->translated_text())
             : QString{};
         transcript_->setBubbleContent(display, translated, TranscriptBubble::SecondaryTone::Muted);
@@ -4623,6 +5171,9 @@ private:
     }
 
     QString currentTranscript() const {
+        // Realtime shows only the utterance being spoken. Each forwarded
+        // sentence is removed from the bubble before the next one starts.
+        if (streaming_output_) return partial_text_;
         QString display = translation_session_.has_value()
             ? to_qstring(translation_session_->original_text())
             : committed_text_;
@@ -4755,6 +5306,9 @@ private:
     bool toggle_latch_ = false;
     QTimer toggle_limit_timer_;
     int paste_delay_ms_ = default_paste_delay_ms;
+    int clipboard_ttl_seconds_ = 0;
+    QString clipboard_owned_text_;
+    QTimer clipboard_clear_timer_;
     VadSettings vad_settings_;
     TextMode text_mode_ = TextMode::Clean;
     bool startup_enabled_ = false;
@@ -4797,6 +5351,7 @@ private:
 
     // SenseVoice or Whisper, whichever fits the spoken language.
     std::unique_ptr<SpeechEngine> engine_;
+    ComputePolicy compute_policy_ = ComputePolicy::Auto;
     QString loaded_recognizer_;  // "<model id>:<language>"
     bool base_models_loaded_ = false;
     ModelManager* model_manager_ = nullptr;
@@ -4806,6 +5361,15 @@ private:
     // Set per session from SpeechSettings::live when speech is usable.
     bool live_speaking_ = false;
     std::size_t live_next_sentence_ = 0;
+    // Realtime dictation: deliver each settled sentence while still listening.
+    bool streaming_output_ = false;
+    std::size_t streaming_next_sentence_ = 0;
+    // Characters of committed_text_ already covered by delivered sentences.
+    qsizetype streaming_source_chars_ = 0;
+    QString streaming_output_text_;
+    bool streaming_fallback_used_ = false;
+    bool streaming_fallback_notified_ = false;
+    bool streaming_delivered_any_ = false;
     std::mutex translator_mutex_;
     std::filesystem::path translator_path_;
     FsmnVadEngine vad_;
@@ -4839,6 +5403,9 @@ private:
     SpeechQueue* speech_queue_ = nullptr;
     std::unique_ptr<TranslationWorker> translation_worker_;
     std::optional<TranslationDirection> translation_ready_direction_;
+    // What the worker actually loaded, shown in the tray/status text.
+    QString translation_backend_;
+    QString translation_device_;
     bool translation_loading_ = false;
     std::optional<TranslationSession> translation_session_;
     std::unordered_map<std::uint64_t, PendingTranslation> translation_tickets_;
@@ -4855,6 +5422,11 @@ private:
 } // namespace
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    // Match the manifest's active code page so the CRT and the narrow-path
+    // file APIs used by whisper.cpp agree on UTF-8.
+    std::setlocale(LC_ALL, ".UTF8");
+#endif
     QApplication application(argc, argv);
     application.setApplicationName(QStringLiteral("SenseVoice 语音输入"));
     application.setOrganizationName(QStringLiteral("SenseVoice"));
@@ -4976,17 +5548,18 @@ int main(int argc, char* argv[]) {
     }
 
     if (preview_mode && !preview_settings_dir.isEmpty()) {
-        InputSettingsDialog dialog(VadSettings{}, QString::fromLatin1(default_hotkey), TextMode::Clean,
+        InputSettingsDialog dialog(VadSettings{}, ComputePolicy::Auto, ComputePolicy::Auto,
+                                   QString::fromLatin1(default_hotkey), TextMode::Clean,
                                    HotkeyTrigger::Hold, ResultDestination::Insert, ResultContent::Both,
                                    ResultContent::Original,
-                                   default_paste_delay_ms, false, {}, TranslationSettings{},
+                                   default_paste_delay_ms, 0, false, false, {}, TranslationSettings{},
                                    SpeechSettings{}, AppearanceSettings{}, BubbleStyle::Panel, {},
-                                   new ModelManager(QDir(dataDirectory()).filePath(QStringLiteral("models")),
+                                   new ModelManager(packagedModelsDirectory(),
                                                     &application));
         dialog.show();
-        auto* tabs = dialog.findChild<QTabWidget*>();
-        for (int tab = 0; tabs != nullptr && tab < tabs->count(); ++tab) {
-            tabs->setCurrentIndex(tab);
+        auto* stack = dialog.findChild<QStackedWidget*>(QStringLiteral("settingsStack"));
+        for (int tab = 0; stack != nullptr && tab < stack->count(); ++tab) {
+            stack->setCurrentIndex(tab);
             application.processEvents();
             dialog.grab().save(QDir(preview_settings_dir).filePath(QStringLiteral("settings-%1.png").arg(tab)));
         }

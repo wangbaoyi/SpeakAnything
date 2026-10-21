@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
+#include <iostream>
 #include <iterator>
 #include <utility>
 
@@ -22,6 +24,17 @@ constexpr std::size_t samples_for_ms(int milliseconds) {
 
 std::size_t maximum_audio_samples(const StreamRecognizerConfig& config) {
     return samples_for_ms(std::clamp(config.maximum_utterance_ms, 1'000, 30'000));
+}
+
+std::int64_t steady_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool serial_vad_from_environment() {
+    const char* value = std::getenv("SENSEVOICE_SERIAL_VAD");
+    return value != nullptr && value[0] != '\0' && std::string(value) != "0";
 }
 
 std::size_t process_working_set_bytes() {
@@ -86,6 +99,7 @@ StreamRecognizer::StreamRecognizer(
       config_(config),
       handler_(std::move(handler)),
       text_processor_(text_processor),
+      serial_vad_(serial_vad_from_environment()),
       stability_(config.stability_history, config.stability_holdback_chars) {}
 
 StreamRecognizer::~StreamRecognizer() {
@@ -120,6 +134,7 @@ void publish_vad_telemetry(
 }
 
 void StreamRecognizer::start() {
+    std::scoped_lock lifecycle(lifecycle_mutex_);
     std::scoped_lock lock(mutex_);
     if (started_) {
         return;
@@ -127,6 +142,9 @@ void StreamRecognizer::start() {
     baseline_working_set_bytes_ = process_working_set_bytes();
     started_ = true;
     worker_ = std::thread(&StreamRecognizer::run, this);
+    if (!serial_vad_ && vad_ != nullptr) {
+        vad_worker_ = std::thread(&StreamRecognizer::run_vad_worker, this);
+    }
 }
 
 void StreamRecognizer::accept_pcm(std::span<const float> samples) {
@@ -139,20 +157,50 @@ void StreamRecognizer::accept_pcm(std::span<const float> samples) {
             return;
         }
         audio_.insert(audio_.end(), samples.begin(), samples.end());
+        ++audio_revision_;
         dirty_ = true;
+        // Coalescing plus throttling: intermediate revisions are skipped, and
+        // a new pass is only requested once at least 80 ms of audio has
+        // arrived since the last pass started. VAD therefore samples the
+        // growing buffer at a bounded rate instead of chasing every chunk.
+        constexpr std::size_t minimum_new_vad_samples = 80 * 16;
+        const std::size_t covered = std::min(audio_.size(), last_vad_pass_samples_);
+        if (audio_.size() - covered >= minimum_new_vad_samples) {
+            vad_requested_ = true;
+        }
+        last_accept_ns_.store(steady_now_ns(), std::memory_order_release);
     }
     condition_.notify_one();
+    vad_condition_.notify_one();
 }
 
 void StreamRecognizer::finish() {
+    std::scoped_lock lifecycle(lifecycle_mutex_);
     {
         std::scoped_lock lock(mutex_);
         if (!started_) {
             return;
         }
         finish_requested_ = true;
+        finish_revision_ = audio_revision_;
+        // If a published pass already covers everything accepted so far the
+        // final can reuse it; otherwise ask for one pass over the final audio.
+        const bool covered = vad_result_.has_value() &&
+            vad_result_->generation == audio_generation_ &&
+            vad_result_->revision >= finish_revision_ &&
+            vad_result_->audio_samples >= audio_.size();
+        if (!covered) {
+            vad_requested_ = true;
+        }
     }
-    condition_.notify_one();
+    condition_.notify_all();
+    vad_condition_.notify_all();
+    // The VAD worker never waits on the ASR worker, so joining it first is
+    // safe. It exits when the recognizer signals that it is done, after any
+    // final VAD pass has been served.
+    if (vad_worker_.joinable()) {
+        vad_worker_.join();
+    }
     if (worker_.joinable()) {
         worker_.join();
     }
@@ -161,6 +209,7 @@ void StreamRecognizer::finish() {
 }
 
 void StreamRecognizer::cancel() {
+    std::scoped_lock lifecycle(lifecycle_mutex_);
     {
         std::scoped_lock lock(mutex_);
         if (!started_) {
@@ -168,7 +217,11 @@ void StreamRecognizer::cancel() {
         }
         cancel_requested_ = true;
     }
-    condition_.notify_one();
+    condition_.notify_all();
+    vad_condition_.notify_all();
+    if (vad_worker_.joinable()) {
+        vad_worker_.join();
+    }
     if (worker_.joinable()) {
         worker_.join();
     }
@@ -177,6 +230,40 @@ void StreamRecognizer::cancel() {
 }
 
 void StreamRecognizer::run() {
+    struct CompletionGuard {
+        StreamRecognizer* self;
+        ~CompletionGuard() {
+            std::scoped_lock lock(self->mutex_);
+            self->asr_done_ = true;
+            self->vad_condition_.notify_all();
+        }
+    } guard{this};
+    if (serial_vad_ || vad_ == nullptr) {
+        run_serial();
+    } else {
+        run_overlapped();
+    }
+}
+
+VadDetectionOptions StreamRecognizer::vad_options() const {
+    return VadDetectionOptions{
+        .maximum_segment_ms = std::max(config_.maximum_utterance_ms, 1'000),
+        .endpoint_silence_ms = config_.endpoint_silence_ms,
+        .speech_noise_threshold = config_.vad_speech_threshold,
+        .minimum_db = config_.vad_minimum_db,
+        .minimum_snr_db = config_.vad_minimum_snr_db,
+        .minimum_speech_ms = config_.vad_minimum_speech_ms,
+    };
+}
+
+bool StreamRecognizer::fresh_vad_available() const {
+    return vad_result_.has_value() &&
+        vad_result_->generation == audio_generation_ &&
+        vad_result_->revision > last_vad_revision_consumed_ &&
+        vad_result_->audio_samples > last_decoded_samples_;
+}
+
+void StreamRecognizer::run_serial() {
     using clock = std::chrono::steady_clock;
     auto next_partial = clock::now();
 
@@ -320,6 +407,332 @@ void StreamRecognizer::run() {
                 result.vad_ms = last_vad_ms_;
                 result.inference_ms = last_inference_ms_;
                 result.hotword_bias_applied = last_hotword_bias_applied_;
+            } else if (final_result && vad_result == nullptr) {
+                // Bounded-wait fallback: decode the whole buffer. Calling
+                // recognize_snapshot here would run a second VAD pass on the
+                // recognizer thread while the VAD worker may still own the
+                // engine.
+                result = recognize_audio(snapshot);
+            } else {
+                result = recognize_snapshot(snapshot, vad_result);
+            }
+            result.audio_ms = static_cast<int>(snapshot_audio_samples / 16);
+            remember_result(result, snapshot.size());
+            if (!final_result || !result.text.empty() || !emitted_utterance_) {
+                emit_result(result, final_result);
+            }
+            if (!final_result && vad_result != nullptr &&
+                vad_result->segments.empty() &&
+                snapshot.size() > samples_for_ms(config_.silence_preroll_ms)) {
+                consume_audio_prefix(
+                    snapshot.size() - samples_for_ms(config_.silence_preroll_ms),
+                    false);
+            }
+        } catch (const std::exception& exception) {
+            emit_error(exception.what());
+            return;
+        }
+
+        if (final_result) {
+            return;
+        }
+    }
+}
+
+void StreamRecognizer::run_vad_worker() {
+    for (;;) {
+        std::vector<float> snapshot;
+        std::uint64_t revision = 0;
+        std::uint64_t generation = 0;
+        {
+            std::unique_lock lock(mutex_);
+            vad_condition_.wait(lock, [&] {
+                return cancel_requested_ || vad_requested_ || asr_done_;
+            });
+            // The recognizer only stops while no final is pending, so once it
+            // is done this worker has nothing left to serve.
+            if (cancel_requested_ || asr_done_) {
+                return;
+            }
+            // Coalesce: take the newest audio, not a backlog of revisions.
+            revision = audio_revision_;
+            generation = audio_generation_;
+            snapshot = audio_;
+            last_vad_pass_samples_ = snapshot.size();
+            vad_requested_ = false;
+            if (snapshot.empty()) {
+                if (finish_requested_) {
+                    return;
+                }
+                continue;
+            }
+        }
+
+        VadResult result;
+        try {
+            result = vad_->detect(snapshot, vad_options());
+        } catch (const std::exception& exception) {
+            std::scoped_lock lock(mutex_);
+            if (!cancel_requested_ && vad_error_.empty()) {
+                vad_error_ = exception.what();
+            }
+            condition_.notify_all();
+            return;
+        } catch (...) {
+            std::scoped_lock lock(mutex_);
+            if (!cancel_requested_ && vad_error_.empty()) {
+                vad_error_ = "FSMN-VAD worker failed";
+            }
+            condition_.notify_all();
+            return;
+        }
+
+        publish_vad_telemetry(
+            result,
+            vad_current_db_,
+            vad_peak_db_,
+            vad_noise_floor_db_,
+            vad_required_db_,
+            vad_speech_probability_,
+            vad_activity_);
+
+        {
+            std::scoped_lock lock(mutex_);
+            if (cancel_requested_) {
+                return;
+            }
+            // A trim happened while this pass was running: the segment times
+            // no longer match the buffer, so drop the result. The trim already
+            // requested a fresh pass for the new generation.
+            if (generation == audio_generation_) {
+                vad_result_ = VadSnapshot{
+                    generation,
+                    revision,
+                    snapshot.size(),
+                    std::move(result),
+                };
+                // This pass already covers everything the final needs. Drop
+                // any request queued before it started so teardown does not
+                // pay for one redundant scan.
+                if (finish_requested_ && revision >= finish_revision_) {
+                    vad_requested_ = false;
+                }
+            }
+        }
+        condition_.notify_all();
+    }
+}
+
+void StreamRecognizer::run_overlapped() {
+    using clock = std::chrono::steady_clock;
+    auto next_partial = clock::now();
+
+    for (;;) {
+        std::vector<float> snapshot;
+        std::size_t snapshot_audio_samples = 0;
+        std::optional<VadSnapshot> vad_work;
+        bool final_result = false;
+        {
+            std::unique_lock lock(mutex_);
+            const std::size_t minimum_samples = samples_for_ms(config_.minimum_audio_ms);
+            const std::size_t minimum_new_samples =
+                samples_for_ms(config_.minimum_new_audio_ms);
+            auto ready = [&] {
+                if (cancel_requested_ || !vad_error_.empty()) {
+                    return true;
+                }
+                if (finish_requested_) {
+                    return true;
+                }
+                if (clock::now() < next_partial) {
+                    return false;
+                }
+                // Gate on what the VAD pass actually covered, not on the raw
+                // buffer: an older result may predate the minimum utterance.
+                if (!fresh_vad_available() ||
+                    vad_result_->audio_samples < minimum_samples) {
+                    return false;
+                }
+                return vad_result_->audio_samples - last_decoded_samples_ >=
+                    minimum_new_samples;
+            };
+            condition_.wait_until(lock, next_partial, ready);
+            if (cancel_requested_) {
+                return;
+            }
+
+            if (finish_requested_) {
+                // A final must see a VAD pass over the current audio, so wait
+                // for a result from this generation covering the whole buffer.
+                // The wait is bounded: a stuck VAD pass must not swallow the
+                // final, so fall back to a plain decode without segments.
+                const bool got_vad = condition_.wait_for(
+                    lock,
+                    std::chrono::seconds(5),
+                    [&] {
+                        return cancel_requested_ || !vad_error_.empty() || audio_.empty() ||
+                            (vad_result_.has_value() &&
+                             vad_result_->generation == audio_generation_ &&
+                             vad_result_->revision >= finish_revision_ &&
+                             vad_result_->audio_samples >= audio_.size());
+                    });
+                if (cancel_requested_) {
+                    return;
+                }
+                if (!vad_error_.empty()) {
+                    // The VAD worker failed: still deliver the final rather
+                    // than dropping it. Without segments this is one decode
+                    // over the whole remaining buffer, exactly the old
+                    // no-VAD path.
+                    std::cerr << "warning: VAD worker failed (" << vad_error_
+                              << "); decoding final without segment boundaries\n";
+                }
+                if (audio_.empty()) {
+                    lock.unlock();
+                    if (!emitted_utterance_) {
+                        emit_result(SenseVoiceResult{}, true);
+                    }
+                    return;
+                }
+                final_result = true;
+                snapshot_audio_samples = audio_.size();
+                snapshot = audio_;
+                if (got_vad && vad_result_.has_value() &&
+                    vad_result_->generation == audio_generation_) {
+                    last_vad_revision_consumed_ = vad_result_->revision;
+                    vad_work = *vad_result_;
+                } else if (!got_vad && vad_error_.empty()) {
+                    std::cerr << "warning: final VAD pass timed out; "
+                                 "decoding without segment boundaries\n";
+                }
+            } else {
+                if (!vad_error_.empty()) {
+                    // During a live session there is no owner left for
+                    // segmentation, so surface the failure instead of
+                    // silently degrading endpoint detection.
+                    const std::string error = vad_error_;
+                    lock.unlock();
+                    emit_error(error);
+                    return;
+                }
+                // wait_until can return on a notify while the predicate is
+                // still false (fresh VAD not published yet, or the pass saw
+                // too little audio). Re-check before decoding.
+                if (!fresh_vad_available() ||
+                    vad_result_->audio_samples < minimum_samples ||
+                    vad_result_->audio_samples - last_decoded_samples_ <
+                        minimum_new_samples) {
+                    next_partial = clock::now() + std::chrono::milliseconds(20);
+                    continue;
+                }
+                // Decode exactly the prefix the VAD pass saw. This keeps
+                // segment times and the endpoint decision consistent, the
+                // same pairing the serial path gets from one shared snapshot.
+                snapshot_audio_samples =
+                    std::min(audio_.size(), vad_result_->audio_samples);
+                snapshot.assign(
+                    audio_.begin(), audio_.begin() + snapshot_audio_samples);
+                last_vad_revision_consumed_ = vad_result_->revision;
+                vad_work = *vad_result_;
+                next_partial = clock::now() +
+                    std::chrono::milliseconds(std::max(50, config_.partial_interval_ms));
+            }
+        }
+
+        if (snapshot.empty()) {
+            if (final_result) {
+                if (!emitted_utterance_) {
+                    emit_result(SenseVoiceResult{}, true);
+                }
+                return;
+            }
+            continue;
+        }
+
+        try {
+            const VadResult* vad_result = nullptr;
+            if (vad_work.has_value()) {
+                last_vad_telemetry_ = vad_work->result;
+                vad_result = &vad_work->result;
+            }
+
+            const std::size_t budget_samples = maximum_audio_samples(config_);
+            const bool over_budget = snapshot.size() > budget_samples;
+            const bool over_memory = process_memory_over_limit(
+                config_.memory_limit_mb,
+                baseline_working_set_bytes_);
+            if (over_budget || (!final_result && over_memory)) {
+                std::size_t split_samples = std::min(budget_samples, snapshot.size());
+                if (vad_result != nullptr) {
+                    std::size_t nearest_silence = 0;
+                    for (const SpeechSegment& segment : vad_result->segments) {
+                        const std::size_t end = std::min(
+                            snapshot.size(),
+                            samples_for_ms(std::max(0, segment.end_ms)));
+                        if (end > 0 && end <= budget_samples) {
+                            nearest_silence = std::max(nearest_silence, end);
+                        }
+                    }
+                    if (nearest_silence >= samples_for_ms(1'000)) {
+                        split_samples = nearest_silence;
+                    }
+                }
+                split_samples = std::min(split_samples, snapshot.size());
+                const std::size_t minimum_split_samples = over_memory && !over_budget
+                    ? samples_for_ms(3'000)
+                    : samples_for_ms(1'000);
+                if (split_samples >= minimum_split_samples) {
+                    SenseVoiceResult result = recognize_audio(
+                        std::span<const float>(snapshot.data(), split_samples));
+                    result.audio_ms = static_cast<int>(split_samples / 16);
+                    remember_result(result, split_samples);
+                    forced_split_ = true;
+                    emit_result(result, true);
+                    emitted_utterance_ = true;
+                    stability_.reset();
+                    consume_audio_prefix(split_samples, true);
+                    next_partial = clock::now();
+                    continue;
+                }
+            }
+
+            if (!final_result && vad_result != nullptr) {
+                const auto endpoint = std::find_if(
+                    vad_result->segments.begin(),
+                    vad_result->segments.end(),
+                    [](const SpeechSegment& segment) { return segment.finalized; });
+                if (endpoint != vad_result->segments.end()) {
+                    SenseVoiceResult result = recognize_snapshot(snapshot, vad_result, &*endpoint);
+                    result.audio_ms = static_cast<int>(snapshot_audio_samples / 16);
+                    remember_result(result, snapshot.size());
+                    emit_result(result, true);
+                    emitted_utterance_ = true;
+                    stability_.reset();
+                    const auto next_segment = std::next(endpoint);
+                    const std::size_t consumed_samples = next_segment == vad_result->segments.end()
+                        ? snapshot.size()
+                        : samples_for_ms(next_segment->start_ms);
+                    consume_audio_prefix(
+                        consumed_samples,
+                        next_segment != vad_result->segments.end());
+                    next_partial = clock::now();
+                    continue;
+                }
+            }
+
+            SenseVoiceResult result;
+            if (final_result && snapshot.size() == last_decoded_samples_) {
+                result.text = last_text_;
+                result.audio_ms = static_cast<int>(snapshot.size() / 16);
+                result.vad_ms = last_vad_ms_;
+                result.inference_ms = last_inference_ms_;
+                result.hotword_bias_applied = last_hotword_bias_applied_;
+            } else if (final_result && vad_result == nullptr) {
+                // Bounded-wait fallback: decode the whole buffer. Calling
+                // recognize_snapshot here would run a second VAD pass on the
+                // recognizer thread while the VAD worker may still own the
+                // engine.
+                result = recognize_audio(snapshot);
             } else {
                 result = recognize_snapshot(snapshot, vad_result);
             }
@@ -416,16 +829,26 @@ SenseVoiceResult StreamRecognizer::recognize_audio(std::span<const float> audio)
 void StreamRecognizer::consume_audio_prefix(
     std::size_t samples,
     bool reprocess_remaining) {
-    std::scoped_lock lock(mutex_);
-    const bool has_unprocessed_audio = audio_.size() > last_decoded_samples_;
-    samples = std::min(samples, audio_.size());
-    audio_.erase(audio_.begin(), audio_.begin() + samples);
-    dirty_ = has_unprocessed_audio || reprocess_remaining;
-    last_decoded_samples_ = 0;
-    last_text_.clear();
-    last_vad_ms_ = 0;
-    last_inference_ms_ = 0;
-    last_hotword_bias_applied_ = false;
+    {
+        std::scoped_lock lock(mutex_);
+        const bool has_unprocessed_audio = audio_.size() > last_decoded_samples_;
+        samples = std::min(samples, audio_.size());
+        audio_.erase(audio_.begin(), audio_.begin() + samples);
+        // Segment times are relative to the buffer start, so the next VAD pass
+        // must start from a new generation. Any in-flight result is discarded
+        // when it arrives and the worker re-evaluates the trimmed buffer.
+        ++audio_revision_;
+        ++audio_generation_;
+        vad_result_.reset();
+        vad_requested_ = true;
+        dirty_ = has_unprocessed_audio || reprocess_remaining;
+        last_decoded_samples_ = 0;
+        last_text_.clear();
+        last_vad_ms_ = 0;
+        last_inference_ms_ = 0;
+        last_hotword_bias_applied_ = false;
+    }
+    vad_condition_.notify_one();
 }
 
 void StreamRecognizer::remember_result(
@@ -454,6 +877,14 @@ void StreamRecognizer::emit_result(const SenseVoiceResult& result, bool final_re
     event.audio_ms = result.audio_ms;
     event.vad_ms = result.vad_ms;
     event.inference_ms = result.inference_ms;
+    if (final_result) {
+        const std::int64_t accepted = last_accept_ns_.load(std::memory_order_acquire);
+        if (accepted != 0) {
+            const std::int64_t latency_ns = steady_now_ns() - accepted;
+            event.final_latency_ms = static_cast<int>(
+                std::max<std::int64_t>(0, latency_ns / 1'000'000));
+        }
+    }
     event.vad_current_db = last_vad_telemetry_.current_db;
     event.vad_peak_db = last_vad_telemetry_.peak_db;
     event.vad_noise_floor_db = last_vad_telemetry_.noise_floor_db;

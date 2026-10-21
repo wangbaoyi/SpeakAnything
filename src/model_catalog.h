@@ -63,6 +63,11 @@ struct CatalogModel {
 };
 
 std::span<const CatalogModel> model_catalog();
+// Subfolder used to keep each kind apart under a models directory:
+// "recognizer", "translator" or "voice".
+std::string_view model_kind_folder(ModelKind kind);
 const CatalogModel* find_model(std::string_view id);
 // Models of one kind usable for a language on this platform, best first.
 std::vector<const CatalogModel*> models_for(ModelKind kind, std::string_view language);
+// Parts that must be fetched on this platform (skips macOS-only parts elsewhere).
+std::vector<const ModelPart*> downloadable_parts(const CatalogModel& model);

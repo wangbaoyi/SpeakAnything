@@ -125,6 +125,10 @@ std::optional<std::size_t> TranslationSession::add_sentence(std::string original
     return sentences_.size() - 1;
 }
 
+const std::string& TranslationSession::original(std::size_t index) const {
+    return sentences_[index].original;
+}
+
 void TranslationSession::set_translation(std::size_t index, std::string translation) {
     if (index >= sentences_.size()) return;
     Sentence& sentence = sentences_[index];

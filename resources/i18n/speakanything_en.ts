@@ -878,5 +878,41 @@ Hold Ctrl + Win to record; on release the text goes to the last cursor position.
         <source>需要下载 %1</source>
         <translation>Needs a %1 download</translation>
     </message>
+    <message>
+        <source>计算设备</source>
+        <translation>Compute device</translation>
+    </message>
+    <message>
+        <source>自动在 GPU 可用时使用 GPU，否则使用 CPU。更改设备后会重新加载识别模型。</source>
+        <translation>Use the GPU when available, otherwise the CPU. Changing the device reloads the recognition model.</translation>
+    </message>
+    <message>
+        <source>自动（优先 GPU）</source>
+        <translation>Automatic (GPU first)</translation>
+    </message>
+    <message>
+        <source>仅 CPU</source>
+        <translation>CPU only</translation>
+    </message>
+    <message>
+        <source>仅 GPU（不可用时加载失败）</source>
+        <translation>GPU only (fails to load when unavailable)</translation>
+    </message>
+    <message>
+        <source>推理设备</source>
+        <translation>Inference device</translation>
+    </message>
+    <message>
+        <source>检测到：%1（%2，显存 %3 GB）</source>
+        <translation>Detected: %1 (%2, %3 GB VRAM)</translation>
+    </message>
+    <message>
+        <source>未检测到可用的 GPU 后端；自动和仅 GPU 都无法使用 GPU。</source>
+        <translation>No usable GPU backend detected; Automatic and GPU only cannot use a GPU.</translation>
+    </message>
+    <message>
+        <source>正在重新加载模型...</source>
+        <translation>Reloading the model...</translation>
+    </message>
 </context>
 </TS>

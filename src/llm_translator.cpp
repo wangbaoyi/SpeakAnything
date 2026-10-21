@@ -18,6 +18,14 @@ namespace {
 
 constexpr int context_tokens = 2048;
 
+// ggml opens files through _wfopen after decoding UTF-8 on Windows, so the
+// narrow string must be UTF-8, not the ANSI code page. This keeps a model
+// under a non-ASCII checkout path loadable.
+std::string utf8_path(const std::filesystem::path& path) {
+    const std::u8string utf8 = path.u8string();
+    return std::string(utf8.begin(), utf8.end());
+}
+
 void ensure_backend() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -61,12 +69,17 @@ class LlmTranslator final : public Translator {
 public:
     LlmTranslator(std::unique_ptr<llama_model, ModelDeleter> model,
                   std::unique_ptr<llama_context, ContextDeleter> context,
-                  TranslationDirection direction)
+                  TranslationDirection direction,
+                  std::string device_label)
         : model_(std::move(model)),
           context_(std::move(context)),
           sampler_(llama_sampler_init_greedy()),
           vocab_(llama_model_get_vocab(model_.get())),
-          direction_(direction) {}
+          direction_(direction),
+          device_label_(std::move(device_label)) {}
+
+    std::string_view backend_name() const override { return "Qwen3 GGUF (llama.cpp)"; }
+    std::string device_label() const override { return device_label_; }
 
     std::optional<std::string> translate(std::string_view text, std::string& error) override {
         return translate(text, TranslationHints{}, error);
@@ -135,22 +148,34 @@ private:
     std::unique_ptr<llama_sampler, SamplerDeleter> sampler_;
     const llama_vocab* vocab_;
     TranslationDirection direction_;
+    std::string device_label_;
 };
 
 } // namespace
 
-TranslatorFactory make_llm_translation_factory(std::filesystem::path model_path, int threads) {
-    return [model_path = std::move(model_path), threads](
+TranslatorFactory make_llm_translation_factory(
+    std::filesystem::path model_path,
+    int threads,
+    ComputeDevice device,
+    std::string device_label) {
+    return [model_path = std::move(model_path), threads, device,
+            device_label = std::move(device_label)](
                TranslationDirection direction, std::string& error) -> std::unique_ptr<Translator> {
         if (!std::filesystem::is_regular_file(model_path)) {
-            error = "missing translation model " + model_path.string();
+            error = "missing translation model " + utf8_path(model_path);
             return nullptr;
         }
         ensure_backend();
+        if (device == ComputeDevice::Gpu && !llama_supports_gpu_offload()) {
+            error = "this llama.cpp build has no GPU backend; refusing to report GPU while running on the CPU";
+            return nullptr;
+        }
         llama_model_params model_params = llama_model_default_params();
-        model_params.n_gpu_layers = -1;
+        // A GPU policy must fail rather than fall back silently; the caller
+        // already checked that a device exists before asking for this load.
+        model_params.n_gpu_layers = device == ComputeDevice::Gpu ? -1 : 0;
         std::unique_ptr<llama_model, ModelDeleter> model(
-            llama_model_load_from_file(model_path.string().c_str(), model_params));
+            llama_model_load_from_file(utf8_path(model_path).c_str(), model_params));
         if (!model) {
             error = "failed to load translation model";
             return nullptr;
@@ -167,6 +192,10 @@ TranslatorFactory make_llm_translation_factory(std::filesystem::path model_path,
             error = "failed to create translation context";
             return nullptr;
         }
-        return std::make_unique<LlmTranslator>(std::move(model), std::move(context), direction);
+        const std::string label = device_label.empty()
+            ? (device == ComputeDevice::Gpu ? "GPU" : "CPU")
+            : device_label;
+        return std::make_unique<LlmTranslator>(
+            std::move(model), std::move(context), direction, label);
     };
 }

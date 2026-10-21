@@ -1,5 +1,6 @@
 #include "sensevoice_engine.h"
 
+#include "fbank.h"
 #include "hotword_boost.h"
 
 #include "ggml-alloc.h"
@@ -26,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <stdexcept>
 #include <string_view>
@@ -37,167 +39,13 @@ namespace {
 
 constexpr float layer_norm_epsilon = 1e-5F;
 constexpr int sample_rate = 16'000;
-constexpr int window_length = 400;
-constexpr int frame_shift = 160;
-constexpr int fft_size = 512;
+// The shared fbank module produces 80 mel bins; SenseVoice stacks 7 of them
+// every 6 frames, which is its 560-wide model input.
 constexpr int mel_bins = 80;
 constexpr int lfr_window = 7;
 constexpr int lfr_stride = 6;
-constexpr float preemphasis = 0.97F;
-constexpr float low_frequency = 20.0F;
-constexpr float high_frequency = 8'000.0F;
 constexpr int feature_dimension = 560;
-
-float mel_frequency(float frequency) {
-    return 1127.0F * std::log(1.0F + frequency / 700.0F);
-}
-
-void fft(std::vector<float>& real, std::vector<float>& imaginary, int size) {
-    for (int index = 1, reverse = 0; index < size; ++index) {
-        int bit = size >> 1;
-        for (; reverse & bit; bit >>= 1) {
-            reverse ^= bit;
-        }
-        reverse ^= bit;
-        if (index < reverse) {
-            std::swap(real[index], real[reverse]);
-            std::swap(imaginary[index], imaginary[reverse]);
-        }
-    }
-
-    for (int length = 2; length <= size; length <<= 1) {
-        const double angle = -2.0 * 3.14159265358979323846 / length;
-        const float rotation_real = std::cos(static_cast<float>(angle));
-        const float rotation_imaginary = std::sin(static_cast<float>(angle));
-        for (int start = 0; start < size; start += length) {
-            float current_real = 1.0F;
-            float current_imaginary = 0.0F;
-            for (int offset = 0; offset < length / 2; ++offset) {
-                const float upper_real = real[start + offset];
-                const float upper_imaginary = imaginary[start + offset];
-                const float lower_real =
-                    real[start + offset + length / 2] * current_real -
-                    imaginary[start + offset + length / 2] * current_imaginary;
-                const float lower_imaginary =
-                    real[start + offset + length / 2] * current_imaginary +
-                    imaginary[start + offset + length / 2] * current_real;
-                real[start + offset] = upper_real + lower_real;
-                imaginary[start + offset] = upper_imaginary + lower_imaginary;
-                real[start + offset + length / 2] = upper_real - lower_real;
-                imaginary[start + offset + length / 2] = upper_imaginary - lower_imaginary;
-                const float next_real =
-                    current_real * rotation_real - current_imaginary * rotation_imaginary;
-                current_imaginary =
-                    current_real * rotation_imaginary + current_imaginary * rotation_real;
-                current_real = next_real;
-            }
-        }
-    }
-}
-
-std::vector<float> compute_fbank(std::span<const float> audio, int& frames) {
-    frames = 0;
-    if (audio.size() < window_length) {
-        return {};
-    }
-
-    std::vector<float> waveform(audio.begin(), audio.end());
-    for (float& sample : waveform) {
-        sample *= 32768.0F;
-    }
-
-    std::vector<float> window(window_length);
-    for (int index = 0; index < window_length; ++index) {
-        window[index] = 0.54F - 0.46F *
-            std::cos(2.0F * 3.14159265358979323846F * index / (window_length - 1));
-    }
-
-    constexpr int spectrum_bins = fft_size / 2 + 1;
-    const float bin_width = static_cast<float>(sample_rate) / fft_size;
-    const float mel_low = mel_frequency(low_frequency);
-    const float mel_high = mel_frequency(high_frequency);
-    const float mel_step = (mel_high - mel_low) / (mel_bins + 1);
-    std::vector<std::vector<float>> filters(
-        mel_bins, std::vector<float>(spectrum_bins, 0.0F));
-    for (int mel = 0; mel < mel_bins; ++mel) {
-        const float left = mel_low + mel * mel_step;
-        const float center = mel_low + (mel + 1) * mel_step;
-        const float right = mel_low + (mel + 2) * mel_step;
-        for (int bin = 0; bin < spectrum_bins; ++bin) {
-            const float frequency = mel_frequency(bin_width * bin);
-            if (frequency > left && frequency < right) {
-                filters[mel][bin] = frequency <= center
-                    ? (frequency - left) / (center - left)
-                    : (right - frequency) / (right - center);
-            }
-        }
-    }
-
-    const int raw_frames =
-        (static_cast<int>(waveform.size()) - window_length) / frame_shift + 1;
-    std::vector<std::vector<float>> features(
-        raw_frames, std::vector<float>(mel_bins));
-    std::vector<float> real(fft_size);
-    std::vector<float> imaginary(fft_size);
-    std::vector<float> frame(window_length);
-    constexpr float floor = 1.1920929e-07F;
-
-    for (int time = 0; time < raw_frames; ++time) {
-        const float* samples = waveform.data() + time * frame_shift;
-        double mean = 0.0;
-        for (int index = 0; index < window_length; ++index) {
-            mean += samples[index];
-        }
-        mean /= window_length;
-        for (int index = 0; index < window_length; ++index) {
-            frame[index] = samples[index] - static_cast<float>(mean);
-        }
-        for (int index = window_length - 1; index > 0; --index) {
-            frame[index] -= preemphasis * frame[index - 1];
-        }
-        frame[0] -= preemphasis * frame[0];
-        for (int index = 0; index < fft_size; ++index) {
-            real[index] = index < window_length ? frame[index] * window[index] : 0.0F;
-            imaginary[index] = 0.0F;
-        }
-        fft(real, imaginary, fft_size);
-        for (int mel = 0; mel < mel_bins; ++mel) {
-            float energy = 0.0F;
-            for (int bin = 0; bin < spectrum_bins; ++bin) {
-                if (filters[mel][bin] > 0.0F) {
-                    energy += filters[mel][bin] *
-                        (real[bin] * real[bin] + imaginary[bin] * imaginary[bin]);
-                }
-            }
-            features[time][mel] = std::log(std::max(energy, floor));
-        }
-    }
-
-    constexpr int left_padding = (lfr_window - 1) / 2;
-    frames = (raw_frames + lfr_stride - 1) / lfr_stride;
-    std::vector<std::vector<float>> padded;
-    padded.reserve(raw_frames + left_padding + lfr_window);
-    for (int index = 0; index < left_padding; ++index) {
-        padded.push_back(features.front());
-    }
-    padded.insert(padded.end(), features.begin(), features.end());
-    while (static_cast<int>(padded.size()) <
-           (frames - 1) * lfr_stride + lfr_window) {
-        padded.push_back(features.back());
-    }
-
-    std::vector<float> output(static_cast<std::size_t>(frames) * feature_dimension);
-    for (int time = 0; time < frames; ++time) {
-        for (int offset = 0; offset < lfr_window; ++offset) {
-            std::memcpy(
-                &output[static_cast<std::size_t>(time) * feature_dimension +
-                        offset * mel_bins],
-                padded[time * lfr_stride + offset].data(),
-                mel_bins * sizeof(float));
-        }
-    }
-    return output;
-}
+static_assert(feature_dimension == lfr_window * mel_bins);
 
 struct ModelConfig {
     int model_dimension = 512;
@@ -476,11 +324,32 @@ struct SenseVoiceEngine::Impl {
     std::unordered_map<std::string, std::vector<int>> hotword_token_cache;
     int threads = 8;
     bool is_loaded = false;
-    // Metal (Apple GPU) view of the same weights; compute falls back to the
-    // CPU backend when unavailable or when the graph uses an op it lacks.
+    ComputePolicy policy = ComputePolicy::Auto;
+    GpuCapability gpu;
+    // Copies of the weights on the CPU and, when selected, on the GPU. The
+    // GPU copy is a buffer allocated by the backend, so the same code works
+    // for discrete memory (CUDA) and unified memory (Metal). Compute falls
+    // back to the CPU backend when the backend is unavailable or the graph
+    // uses an op it lacks.
     ggml_backend_t gpu_backend = nullptr;
     ggml_backend_buffer_t gpu_weights = nullptr;
+    ggml_backend_buffer_t weights = nullptr;
     bool use_gpu = false;
+    // GGUF tensor layout, kept so the CPU weights can be rebuilt from the file
+    // if a GPU graph turns out to be unsupported mid-run.
+    struct WeightChunk {
+        ggml_tensor* tensor = nullptr;
+        std::uint64_t offset = 0;
+        std::size_t size = 0;
+    };
+    std::filesystem::path model_path;
+    std::vector<WeightChunk> weight_chunks;
+    // Query-token rows copied out of embed.weight before a GPU upload. The
+    // query embedding is built on the host, and a device tensor's data pointer
+    // is not readable there.
+    std::unordered_map<int, std::vector<float>> query_embeddings;
+    std::string device_label = "CPU";
+    std::string gpu_unsupported_op;
     // SenseVoice language query id: 0 auto, 3 zh, 4 en, 7 yue, 11 ja, 12 ko.
     int language_id = 0;
     bool gpu_checked = false;
@@ -569,36 +438,123 @@ struct SenseVoiceEngine::Impl {
         return result;
     }
 
-    // Unified memory: wrap the already-loaded weights in a GPU buffer in place.
-    void try_enable_gpu() {
-#ifdef __APPLE__
-        if (gpu_disabled()) return;
-        ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-        if (device == nullptr || model.weights_context == nullptr) return;
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(device, &props);
-        if (!props.caps.buffer_from_host_ptr) return;
-        size_t largest = 0;
-        for (ggml_tensor* tensor = ggml_get_first_tensor(model.weights_context); tensor != nullptr;
-             tensor = ggml_get_next_tensor(model.weights_context, tensor)) {
-            largest = std::max(largest, ggml_nbytes(tensor));
+    // Allocates a buffer for every weight tensor on `backend` and uploads the
+    // tensor bytes from the GGUF file. The GGUF is opened with no_alloc, so
+    // tensor data has no host allocation to reuse or invalidate.
+    bool upload_weights(
+        ggml_backend_t backend, ggml_backend_buffer_t& output, std::string& error) {
+        for (ggml_tensor* tensor = ggml_get_first_tensor(model.weights_context);
+             tensor != nullptr; tensor = ggml_get_next_tensor(model.weights_context, tensor)) {
+            if (tensor->view_src == nullptr) {
+                tensor->data = nullptr;
+                tensor->buffer = nullptr;
+            }
         }
-        gpu_weights = ggml_backend_dev_buffer_from_host_ptr(
-            device, ggml_get_mem_buffer(model.weights_context),
-            ggml_get_mem_size(model.weights_context), largest);
-        if (gpu_weights == nullptr) return;
+        ggml_backend_buffer_t buffer =
+            ggml_backend_alloc_ctx_tensors(model.weights_context, backend);
+        if (buffer == nullptr) {
+            error = "failed to allocate model weights on " +
+                std::string(ggml_backend_name(backend));
+            return false;
+        }
+        std::ifstream file(model_path, std::ios::binary);
+        if (!file) {
+            ggml_backend_buffer_free(buffer);
+            error = "failed to reopen " + model_path.string();
+            return false;
+        }
+        std::vector<char> bytes;
+        for (const WeightChunk& chunk : weight_chunks) {
+            bytes.resize(chunk.size);
+            file.seekg(static_cast<std::streamoff>(chunk.offset));
+            if (!file.read(bytes.data(), static_cast<std::streamsize>(chunk.size))) {
+                ggml_backend_buffer_free(buffer);
+                error = "truncated GGUF tensor data";
+                return false;
+            }
+            ggml_backend_tensor_set(chunk.tensor, bytes.data(), 0, chunk.size);
+        }
+        output = buffer;
+        return true;
+    }
+
+    bool enable_gpu(std::string& error) {
+        if (gpu_disabled()) {
+            error = "GPU use is disabled by SENSEVOICE_NO_GPU";
+            return false;
+        }
+        gpu = detect_gpu_capability();
+        if (!gpu.available) {
+            error = "no ggml GPU backend/device is available";
+            return false;
+        }
+        auto* device = static_cast<ggml_backend_dev_t>(gpu.device_handle);
         gpu_backend = ggml_backend_dev_init(device, nullptr);
         if (gpu_backend == nullptr) {
-            ggml_backend_buffer_free(gpu_weights);
-            gpu_weights = nullptr;
-            return;
+            error = "failed to initialize the " + gpu.backend + " backend";
+            return false;
         }
-        for (ggml_tensor* tensor = ggml_get_first_tensor(model.weights_context); tensor != nullptr;
-             tensor = ggml_get_next_tensor(model.weights_context, tensor)) {
-            tensor->buffer = gpu_weights;
+        if (!upload_weights(gpu_backend, gpu_weights, error)) {
+            ggml_backend_free(gpu_backend);
+            gpu_backend = nullptr;
+            return false;
         }
         use_gpu = true;
-#endif
+        device_label = compute_device_label(ComputeDevice::Gpu, gpu);
+        return true;
+    }
+
+    // Releases the GPU resources and rebuilds the weights on the CPU backend.
+    // The caller is responsible for rebuilding any graph that views weights.
+    void disable_gpu() {
+        if (gpu_weights != nullptr) {
+            ggml_backend_buffer_free(gpu_weights);
+            gpu_weights = nullptr;
+        }
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
+            gpu_backend = nullptr;
+        }
+        use_gpu = false;
+        device_label = "CPU";
+        std::string error;
+        if (weights == nullptr && !upload_weights(backend, weights, error)) {
+            throw std::runtime_error("failed to restore CPU weights: " + error);
+        }
+    }
+
+    // Copies the rows of embed.weight that set_language can select. Runs after
+    // the weights exist on whichever backend owns them; ggml_backend_tensor_get
+    // copies from device memory when needed.
+    void cache_query_embeddings() {
+        ggml_tensor* embedding = model.get("embed.weight");
+        if (embedding->type != GGML_TYPE_F32 || embedding->data == nullptr) {
+            throw std::runtime_error("SenseVoice query embedding must be resident F32 data");
+        }
+        const int dimension = feature_dimension;
+        const std::size_t element_count = ggml_nelements(embedding);
+        std::vector<int> ids = query_tokens;
+        // Every language id set_language can write into query_tokens[0].
+        for (const int id : {0, 3, 4, 7, 11, 12}) ids.push_back(id);
+        for (const int token_id : ids) {
+            if (token_id < 0 || token_id >= model.config.vocabulary_size) continue;
+            if (static_cast<std::size_t>(token_id + 1) * dimension > element_count) continue;
+            if (query_embeddings.contains(token_id)) continue;
+            std::vector<float> row(static_cast<std::size_t>(dimension));
+            ggml_backend_tensor_get(
+                embedding, row.data(),
+                static_cast<std::size_t>(token_id) * dimension * sizeof(float),
+                row.size() * sizeof(float));
+            query_embeddings.emplace(token_id, std::move(row));
+        }
+    }
+
+    const std::vector<float>& query_embedding(int token_id) const {
+        const auto iterator = query_embeddings.find(token_id);
+        if (iterator == query_embeddings.end()) {
+            throw std::runtime_error("missing SenseVoice query embedding row");
+        }
+        return iterator->second;
     }
 
     static bool gpu_disabled() {
@@ -607,11 +563,16 @@ struct SenseVoiceEngine::Impl {
     }
 
     ~Impl() {
-        if (gpu_backend != nullptr) {
-            ggml_backend_free(gpu_backend);
-        }
+        // The weight buffer and backend must outlive no tensor, but the buffer
+        // has to be released before the backend that owns it.
         if (gpu_weights != nullptr) {
             ggml_backend_buffer_free(gpu_weights);
+        }
+        if (weights != nullptr) {
+            ggml_backend_buffer_free(weights);
+        }
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
         }
         if (backend != nullptr) {
             ggml_backend_free(backend);
@@ -629,7 +590,8 @@ SenseVoiceEngine::~SenseVoiceEngine() = default;
 bool SenseVoiceEngine::load(
     const std::filesystem::path& model_path,
     int threads,
-    std::string& error) {
+    std::string& error,
+    ComputePolicy policy) {
     if (impl_->is_loaded) {
         error = "SenseVoice model is already loaded";
         return false;
@@ -651,7 +613,12 @@ bool SenseVoiceEngine::load(
         return false;
     }
 
-    gguf_init_params parameters{false, &impl_->model.weights_context};
+    // Metadata only: ggml_backend_alloc_ctx_tensors owns the tensor memory on
+    // whichever backend runs the model, and the bytes are streamed from the
+    // file afterwards. This also keeps a CPU fallback independent of any GPU
+    // allocation that was already tried.
+    gguf_init_params parameters{true, &impl_->model.weights_context};
+    impl_->model_path = model_path;
     const auto path_u8 = model_path.u8string();
     const std::string path_utf8(
         reinterpret_cast<const char*>(path_u8.data()), path_u8.size());
@@ -695,9 +662,18 @@ bool SenseVoiceEngine::load(
     impl_->prepare_hotword_vocabulary();
 
     const int tensor_count = static_cast<int>(gguf_get_n_tensors(gguf));
+    const std::uint64_t data_offset = gguf_get_data_offset(gguf);
+    impl_->weight_chunks.clear();
+    impl_->weight_chunks.reserve(static_cast<std::size_t>(tensor_count));
     for (int index = 0; index < tensor_count; ++index) {
         const char* name = gguf_get_tensor_name(gguf, index);
-        impl_->model.tensors[name] = ggml_get_tensor(impl_->model.weights_context, name);
+        ggml_tensor* tensor = ggml_get_tensor(impl_->model.weights_context, name);
+        impl_->model.tensors[name] = tensor;
+        impl_->weight_chunks.push_back({
+            tensor,
+            data_offset + gguf_get_tensor_offset(gguf, index),
+            ggml_nbytes(tensor),
+        });
     }
     gguf_free(gguf);
 
@@ -716,16 +692,63 @@ bool SenseVoiceEngine::load(
 
     impl_->threads = std::max(1, threads);
     ggml_backend_cpu_set_n_threads(impl_->backend, impl_->threads);
-    impl_->try_enable_gpu();
+    impl_->policy = policy;
+
+    const ComputeResolution resolution =
+        resolve_compute(policy, detect_gpu_capability());
+    if (!resolution.ok()) {
+        error = resolution.error;
+        return false;
+    }
+    if (resolution.device == ComputeDevice::Gpu) {
+        std::string gpu_error;
+        if (!impl_->enable_gpu(gpu_error)) {
+            if (policy == ComputePolicy::Gpu) {
+                error = gpu_error;
+                return false;
+            }
+            // Auto falls back to the CPU backend.
+            impl_->device_label = "CPU";
+        }
+    }
+    if (!impl_->use_gpu) {
+        std::string weights_error;
+        if (!impl_->upload_weights(impl_->backend, impl_->weights, weights_error)) {
+            error = weights_error;
+            return false;
+        }
+    }
+    try {
+        impl_->cache_query_embeddings();
+    } catch (const std::exception& exception) {
+        error = exception.what();
+        return false;
+    }
+
     impl_->is_loaded = true;
     if (impl_->use_gpu) {
-        // Settles GPU-vs-CPU (op support) and compiles the Metal kernels now,
-        // so the first dictation isn't the slow one.
+        // Settles GPU-vs-CPU (op support) and compiles the GPU kernels now,
+        // so the first dictation isn't the slow one, and so device() reports
+        // what recognition will actually use.
         const std::vector<float> silence(sample_rate, 0.0F);
         try {
             recognize(silence);
-        } catch (const std::exception&) {
-            impl_->use_gpu = false;
+        } catch (const std::exception& exception) {
+            if (policy == ComputePolicy::Gpu) {
+                error = std::string("GPU inference is unavailable: ") + exception.what();
+                impl_->disable_gpu();
+                impl_->is_loaded = false;
+                return false;
+            }
+            impl_->disable_gpu();
+        }
+        if (!impl_->use_gpu && policy == ComputePolicy::Gpu) {
+            error = "GPU inference is unavailable: " +
+                (impl_->gpu_unsupported_op.empty()
+                     ? std::string("the GPU backend rejected the graph")
+                     : "the GPU backend does not support " + impl_->gpu_unsupported_op);
+            impl_->is_loaded = false;
+            return false;
         }
     }
     return true;
@@ -754,7 +777,7 @@ const char* SenseVoiceEngine::device() const {
 #ifdef SENSEVOICE_WITH_COREML
     if (impl_->coreml != nullptr) return "Neural Engine";
 #endif
-    return impl_->use_gpu ? "GPU (Metal)" : "CPU";
+    return impl_->device_label.c_str();
 }
 
 SenseVoiceResult SenseVoiceEngine::recognize(
@@ -766,8 +789,22 @@ SenseVoiceResult SenseVoiceEngine::recognize(
 
     SenseVoiceResult result;
     result.audio_ms = static_cast<int>(pcm_16khz_mono.size() * 1000 / sample_rate);
+    // Raw log-mel frames are computed in parallel (up to 4 workers, bounded by
+    // the engine's thread count) and then stacked on this thread. Frames are
+    // independent, so the result is identical to the serial path;
+    // SENSEVOICE_SERIAL_FBANK=1 forces that path for benchmarks.
+    int raw_frames = 0;
+    const fbank::Config fbank_config;
+    const std::vector<float> log_mel = fbank::compute_log_mel(
+        pcm_16khz_mono, fbank_config, raw_frames, impl_->threads);
     int feature_frames = 0;
-    std::vector<float> features = compute_fbank(pcm_16khz_mono, feature_frames);
+    std::vector<float> features = fbank::stack_lfr(
+        log_mel,
+        raw_frames,
+        fbank_config.mel_bins,
+        lfr_window,
+        lfr_stride,
+        feature_frames);
     if (features.empty()) {
         return result;
     }
@@ -781,15 +818,11 @@ SenseVoiceResult SenseVoiceEngine::recognize(
     const int query_count = static_cast<int>(impl_->query_tokens.size());
     const int total_frames = query_count + feature_frames;
     std::vector<float> input(static_cast<std::size_t>(total_frames) * feature_dimension);
-    ggml_tensor* embedding = impl_->model.get("embed.weight");
-    if (embedding->type != GGML_TYPE_F32 || embedding->data == nullptr) {
-        throw std::runtime_error("SenseVoice query embedding must be resident F32 data");
-    }
-    const auto* embedding_data = static_cast<const float*>(embedding->data);
     for (int index = 0; index < query_count; ++index) {
+        const std::vector<float>& row = impl_->query_embedding(impl_->query_tokens[index]);
         std::memcpy(
             &input[static_cast<std::size_t>(index) * feature_dimension],
-            &embedding_data[static_cast<std::size_t>(impl_->query_tokens[index]) * feature_dimension],
+            row.data(),
             feature_dimension * sizeof(float));
     }
     std::memcpy(
@@ -807,112 +840,164 @@ SenseVoiceResult SenseVoiceEngine::recognize(
         nullptr,
         true,
     };
-    ggml_context* context = ggml_init(context_parameters);
-    if (context == nullptr) {
-        throw std::runtime_error("failed to allocate ggml graph context");
-    }
 
+    ggml_context* context = nullptr;
     ggml_gallocr_t allocator = nullptr;
-    try {
-        ggml_tensor* graph_input = ggml_new_tensor_2d(
-            context, GGML_TYPE_F32, feature_dimension, total_frames);
-        ggml_set_input(graph_input);
-        ggml_tensor* hidden = sanm_layer(
-            context,
-            impl_->model,
-            "encoder.encoders0.0.",
-            graph_input,
-            total_frames,
-            false);
-        for (int index = 0; index < impl_->model.config.encoder_blocks - 1; ++index) {
-            hidden = sanm_layer(
+    bool computed = false;
+    // Two attempts at most: one on the GPU, then one rebuild on the CPU when
+    // an Auto policy discovers the GPU cannot run the graph. The graph must be
+    // rebuilt for a fallback because its views captured the weight pointers.
+    for (int attempt = 0; attempt < 2 && !computed; ++attempt) {
+        context = ggml_init(context_parameters);
+        if (context == nullptr) {
+            throw std::runtime_error("failed to allocate ggml graph context");
+        }
+        allocator = nullptr;
+        bool retry = false;
+        try {
+            ggml_tensor* graph_input = ggml_new_tensor_2d(
+                context, GGML_TYPE_F32, feature_dimension, total_frames);
+            ggml_set_input(graph_input);
+            ggml_tensor* hidden = sanm_layer(
                 context,
                 impl_->model,
-                "encoder.encoders." + std::to_string(index) + ".",
-                hidden,
+                "encoder.encoders0.0.",
+                graph_input,
                 total_frames,
-                true);
-        }
-        hidden = layer_norm(
-            context,
-            hidden,
-            impl_->model.get("encoder.after_norm.weight"),
-            impl_->model.get("encoder.after_norm.bias"));
-        for (int index = 0; index < impl_->model.config.tp_blocks; ++index) {
-            hidden = sanm_layer(
+                false);
+            for (int index = 0; index < impl_->model.config.encoder_blocks - 1; ++index) {
+                hidden = sanm_layer(
+                    context,
+                    impl_->model,
+                    "encoder.encoders." + std::to_string(index) + ".",
+                    hidden,
+                    total_frames,
+                    true);
+            }
+            hidden = layer_norm(
                 context,
-                impl_->model,
-                "encoder.tp_encoders." + std::to_string(index) + ".",
                 hidden,
-                total_frames,
-                true);
-        }
-        hidden = layer_norm(
-            context,
-            hidden,
-            impl_->model.get("encoder.tp_norm.weight"),
-            impl_->model.get("encoder.tp_norm.bias"));
-        ggml_tensor* logits = linear(
-            context,
-            impl_->model.get("ctc.ctc_lo.weight"),
-            impl_->model.get("ctc.ctc_lo.bias"),
-            hidden);
-        ggml_set_output(logits);
+                impl_->model.get("encoder.after_norm.weight"),
+                impl_->model.get("encoder.after_norm.bias"));
+            for (int index = 0; index < impl_->model.config.tp_blocks; ++index) {
+                hidden = sanm_layer(
+                    context,
+                    impl_->model,
+                    "encoder.tp_encoders." + std::to_string(index) + ".",
+                    hidden,
+                    total_frames,
+                    true);
+            }
+            hidden = layer_norm(
+                context,
+                hidden,
+                impl_->model.get("encoder.tp_norm.weight"),
+                impl_->model.get("encoder.tp_norm.bias"));
+            ggml_tensor* logits = linear(
+                context,
+                impl_->model.get("ctc.ctc_lo.weight"),
+                impl_->model.get("ctc.ctc_lo.bias"),
+                hidden);
+            ggml_set_output(logits);
 
-        ggml_cgraph* graph = ggml_new_graph_custom(context, 32'768, false);
-        ggml_build_forward_expand(graph, logits);
-        if (impl_->use_gpu && !impl_->gpu_checked) {
-            impl_->gpu_checked = true;
-            for (int index = 0; index < ggml_graph_n_nodes(graph); ++index) {
-                if (!ggml_backend_supports_op(impl_->gpu_backend, ggml_graph_node(graph, index))) {
+            ggml_cgraph* graph = ggml_new_graph_custom(context, 32'768, false);
+            ggml_build_forward_expand(graph, logits);
+            if (impl_->use_gpu && !impl_->gpu_checked) {
+                impl_->gpu_checked = true;
+                for (int index = 0; index < ggml_graph_n_nodes(graph); ++index) {
+                    ggml_tensor* node = ggml_graph_node(graph, index);
+                    if (ggml_backend_supports_op(impl_->gpu_backend, node)) continue;
+                    impl_->gpu_unsupported_op =
+                        std::string(ggml_op_desc(node)) + " (" + ggml_type_name(node->type) + ")";
                     if (std::getenv("SENSEVOICE_DEBUG_GPU") != nullptr) {
-                        ggml_tensor* node = ggml_graph_node(graph, index);
-                        std::fprintf(stderr, "Metal lacks %s (%s) type %s src0 %s\n", ggml_op_desc(node), node->name,
-                            ggml_type_name(node->type), node->src[0] ? ggml_type_name(node->src[0]->type) : "-");
-                        continue;
+                        std::fprintf(stderr, "%s lacks %s (%s) type %s src0 %s\n",
+                            impl_->gpu.backend.c_str(), ggml_op_desc(node), node->name,
+                            ggml_type_name(node->type),
+                            node->src[0] ? ggml_type_name(node->src[0]->type) : "-");
                     }
-                    impl_->use_gpu = false;
+                    if (impl_->policy == ComputePolicy::Gpu) {
+                        throw std::runtime_error("the " + impl_->gpu.backend +
+                            " backend does not support " + impl_->gpu_unsupported_op);
+                    }
+                    impl_->disable_gpu();
+                    retry = true;
                     break;
                 }
             }
-        }
-        ggml_backend_t compute_backend = impl_->use_gpu ? impl_->gpu_backend : impl_->backend;
-        allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(compute_backend));
-        if (!ggml_gallocr_alloc_graph(allocator, graph)) {
-            throw std::runtime_error("failed to allocate SenseVoice compute graph");
-        }
-        ggml_backend_tensor_set(graph_input, input.data(), 0, ggml_nbytes(graph_input));
-        if (ggml_backend_graph_compute(compute_backend, graph) != GGML_STATUS_SUCCESS) {
-            throw std::runtime_error("SenseVoice graph computation failed");
-        }
-
-        const int vocabulary_size = impl_->model.config.vocabulary_size;
-        std::vector<float> host_logits(
-            static_cast<std::size_t>(vocabulary_size) * total_frames);
-        ggml_backend_tensor_get(logits, host_logits.data(), 0, ggml_nbytes(logits));
-        std::vector<CtcHotword> encoded_hotwords;
-        encoded_hotwords.reserve(hotwords.size());
-        for (const HotwordBoostPhrase& hotword : hotwords) {
-            std::vector<int> token_ids = impl_->tokenize_hotword(hotword.phrase);
-            if (token_ids.size() >= 2 && hotword.boost > 0.0F) {
-                encoded_hotwords.push_back({std::move(token_ids), hotword.boost});
+            if (!retry) {
+                ggml_backend_t compute_backend =
+                    impl_->use_gpu ? impl_->gpu_backend : impl_->backend;
+                allocator = ggml_gallocr_new(
+                    ggml_backend_get_default_buffer_type(compute_backend));
+                if (allocator == nullptr || !ggml_gallocr_alloc_graph(allocator, graph)) {
+                    if (impl_->use_gpu && impl_->policy != ComputePolicy::Gpu) {
+                        impl_->gpu_unsupported_op = "graph allocation";
+                        impl_->disable_gpu();
+                        retry = true;
+                    } else {
+                        throw std::runtime_error("failed to allocate SenseVoice compute graph");
+                    }
+                }
             }
+            if (!retry) {
+                ggml_backend_t compute_backend =
+                    impl_->use_gpu ? impl_->gpu_backend : impl_->backend;
+                ggml_backend_tensor_set(
+                    graph_input, input.data(), 0, ggml_nbytes(graph_input));
+                if (ggml_backend_graph_compute(compute_backend, graph) != GGML_STATUS_SUCCESS) {
+                    if (impl_->use_gpu && impl_->policy != ComputePolicy::Gpu) {
+                        impl_->gpu_unsupported_op = "graph execution";
+                        impl_->disable_gpu();
+                        retry = true;
+                    } else {
+                        throw std::runtime_error("SenseVoice graph computation failed");
+                    }
+                }
+            }
+            if (!retry) {
+                const int vocabulary_size = impl_->model.config.vocabulary_size;
+                std::vector<float> host_logits(
+                    static_cast<std::size_t>(vocabulary_size) * total_frames);
+                ggml_backend_tensor_get(logits, host_logits.data(), 0, ggml_nbytes(logits));
+                std::vector<CtcHotword> encoded_hotwords;
+                encoded_hotwords.reserve(hotwords.size());
+                for (const HotwordBoostPhrase& hotword : hotwords) {
+                    std::vector<int> token_ids = impl_->tokenize_hotword(hotword.phrase);
+                    if (token_ids.size() >= 2 && hotword.boost > 0.0F) {
+                        encoded_hotwords.push_back({std::move(token_ids), hotword.boost});
+                    }
+                }
+                const CtcHotwordDecodeResult decoded = decode_ctc_with_hotword_bias(
+                    host_logits,
+                    total_frames,
+                    vocabulary_size,
+                    impl_->model.config.blank_id,
+                    encoded_hotwords);
+                result.text = with_laughter(
+                    detokenize(decoded.token_ids, impl_->vocabulary),
+                    decoded.token_ids,
+                    impl_->vocabulary);
+                result.hotword_bias_applied = decoded.used_hotword_bias;
+                computed = true;
+            }
+        } catch (...) {
+            if (allocator != nullptr) {
+                ggml_gallocr_free(allocator);
+            }
+            ggml_free(context);
+            throw;
         }
-        const CtcHotwordDecodeResult decoded = decode_ctc_with_hotword_bias(
-            host_logits,
-            total_frames,
-            vocabulary_size,
-            impl_->model.config.blank_id,
-            encoded_hotwords);
-        result.text = with_laughter(
-            detokenize(decoded.token_ids, impl_->vocabulary), decoded.token_ids, impl_->vocabulary);
-        result.hotword_bias_applied = decoded.used_hotword_bias;
-    } catch (...) {
-        if (allocator != nullptr) {
-            ggml_gallocr_free(allocator);
+        if (retry) {
+            if (allocator != nullptr) {
+                ggml_gallocr_free(allocator);
+                allocator = nullptr;
+            }
+            ggml_free(context);
+            context = nullptr;
         }
-        ggml_free(context);
-        throw;
+    }
+    if (!computed || context == nullptr) {
+        throw std::runtime_error("SenseVoice graph computation failed");
     }
 
     ggml_gallocr_free(allocator);

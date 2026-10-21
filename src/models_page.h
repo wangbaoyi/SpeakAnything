@@ -17,6 +17,9 @@ struct ModelChoices {
     QHash<QString, QString> recognizer; // language -> model id
     QHash<QString, QString> voice;      // language -> model id
     QString translator = QStringLiteral("auto");
+    // Extra places to look for models the user downloaded elsewhere.
+    QString custom_directory;              // an extra search root
+    QHash<QString, QString> custom_paths;  // model id -> file or folder
 };
 
 // Settings page: pick the recognizer, translator and voice for the current
@@ -35,11 +38,18 @@ private:
         QComboBox* combo = nullptr;
         QLabel* status = nullptr;
         QPushButton* download = nullptr;
+        QPushButton* browser = nullptr;
+        QPushButton* import_button = nullptr;
         QPushButton* remove = nullptr;
         QProgressBar* progress = nullptr;
     };
 
     void addRow(Row& row, const QString& title, const QString& hint);
+    void addDirectoryControls();
+    void importModel(Row& row);
+    void chooseDirectory();
+    void resetDirectory();
+    void refreshDirectoryLabel();
     void fill(Row& row);
     void refresh(Row& row);
     [[nodiscard]] QString language(const Row& row) const;
@@ -48,6 +58,7 @@ private:
 
     ModelManager* manager_;
     ModelChoices choices_;
+    QLabel* directory_label_ = nullptr;
     QString source_ = QStringLiteral("zh");
     QString target_ = QStringLiteral("en");
     Row recognizer_{ModelKind::Recognizer};

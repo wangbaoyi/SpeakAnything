@@ -246,3 +246,23 @@ std::vector<const CatalogModel*> models_for(ModelKind kind, std::string_view lan
                      [](const CatalogModel* a, const CatalogModel* b) { return a->rank > b->rank; });
     return result;
 }
+
+std::string_view model_kind_folder(ModelKind kind) {
+    switch (kind) {
+    case ModelKind::Recognizer: return "recognizer";
+    case ModelKind::Translator: return "translator";
+    case ModelKind::Voice: return "voice";
+    }
+    return "recognizer";
+}
+
+std::vector<const ModelPart*> downloadable_parts(const CatalogModel& model) {
+    std::vector<const ModelPart*> result;
+    for (const ModelPart& part : model.parts) {
+#ifndef __APPLE__
+        if (part.apple_only) continue;
+#endif
+        result.push_back(&part);
+    }
+    return result;
+}

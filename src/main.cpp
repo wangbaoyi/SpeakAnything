@@ -1,4 +1,6 @@
 #include "audio_io.h"
+#include "compute_policy.h"
+#include "fbank.h"
 #include "fsmn_vad_engine.h"
 #include "sensevoice_engine.h"
 #include "whisper_engine.h"
@@ -40,6 +42,9 @@ struct Options {
     std::optional<std::filesystem::path> audio;
     bool microphone = false;
     int threads = 8;
+    // 0 means "auto": min(4, --threads). The FSMN-VAD model is small, and
+    // four threads keeps it from stealing the ASR pool during overlap.
+    int vad_threads = 0;
     int frame_ms = 20;
     int partial_ms = 450;
     int minimum_audio_ms = 600;
@@ -58,6 +63,11 @@ struct Options {
     double replay_speed = 1.0;
     std::optional<TranslationDirection> translate;
     std::optional<std::filesystem::path> translation_models;
+    std::optional<std::filesystem::path> translation_model;
+    ComputePolicy compute = ComputePolicy::Auto;
+    // Empty means "follow --device", resolved after parsing so the two flags
+    // can appear in any order.
+    std::optional<ComputePolicy> translation_compute;
 };
 
 void print_usage() {
@@ -67,7 +77,10 @@ void print_usage() {
         << "  sensevoice-stream --model MODEL.gguf --vad VAD.gguf --mic [options]\n"
         << "  sensevoice-stream --whisper ggml-MODEL.bin --language bg --vad VAD.gguf --audio FILE\n\n"
         << "Options:\n"
+        << "  --device auto|cpu|gpu  speech recognition device (default auto: GPU when available)\n"
+        << "  --translation-device auto|cpu|gpu  translation device (default: follow --device)\n"
         << "  --threads N          ggml CPU threads (default 8)\n"
+        << "  --vad-threads N      FSMN-VAD CPU threads (default min(4, --threads))\n"
         << "  --frame-ms N         input frame size in ms (default 20)\n"
         << "  --partial-ms N       target partial interval in ms (default 450)\n"
         << "  --min-audio-ms N     audio required before first partial (default 600)\n"
@@ -84,8 +97,13 @@ void print_usage() {
         << "  --corrections FILE   tab-separated deterministic correction rules\n"
         << "  --replay-speed N     file replay speed; 1 is real time (default 1)\n"
         << "  --replay-tail-silence-ms N  append silence when testing endpoints\n"
-        << "  --translate zh-en|en-zh  translate each final result with Opus-MT\n"
-        << "  --translation-models DIR  converted Opus-MT models (default: models next to the exe)\n";
+        << "  --translate zh-en|en-zh  translate each final result (Opus-MT on CPU, Qwen GGUF on GPU)\n"
+        << "  --translation-models DIR  model root holding translator/ and Opus-MT folders\n"
+        << "                            (default: modelspt or models next to the exe)\n"
+        << "  --translation-model FILE  Qwen GGUF file for the GPU policy (default: discover one)\n"
+        << "\nEnvironment:\n"
+        << "  SENSEVOICE_SERIAL_VAD=1  run VAD before ASR on one thread (old path, for benchmarks)\n"
+        << "  SENSEVOICE_SERIAL_FBANK=1  compute fbank features on one thread (for benchmarks)\n";
 }
 
 bool parse_integer(
@@ -177,9 +195,34 @@ std::optional<Options> parse_options(int argc, NativeCharacter** argv) {
             options.audio = std::filesystem::path(value);
         } else if (argument == "--mic") {
             options.microphone = true;
+        } else if (argument == "--device") {
+            const NativeCharacter* value = next();
+            if (value == nullptr) return std::nullopt;
+            const std::string name = option_name(value);
+            const std::optional<ComputePolicy> parsed = parse_compute_policy(name);
+            if (!parsed.has_value()) {
+                std::cerr << "Unknown compute device: " << name << '\n';
+                return std::nullopt;
+            }
+            options.compute = *parsed;
+        } else if (argument == "--translation-device") {
+            const NativeCharacter* value = next();
+            if (value == nullptr) return std::nullopt;
+            const std::string name = option_name(value);
+            const std::optional<ComputePolicy> parsed = parse_compute_policy(name);
+            if (!parsed.has_value()) {
+                std::cerr << "Unknown translation device: " << name << '\n';
+                return std::nullopt;
+            }
+            options.translation_compute = *parsed;
         } else if (argument == "--threads") {
             const NativeCharacter* value = next();
             if (value == nullptr || !parse_integer(value, 1, 64, options.threads)) {
+                return std::nullopt;
+            }
+        } else if (argument == "--vad-threads") {
+            const NativeCharacter* value = next();
+            if (value == nullptr || !parse_integer(value, 1, 64, options.vad_threads)) {
                 return std::nullopt;
             }
         } else if (argument == "--frame-ms") {
@@ -284,6 +327,12 @@ std::optional<Options> parse_options(int argc, NativeCharacter** argv) {
                 return std::nullopt;
             }
             options.translation_models = std::filesystem::path(value);
+        } else if (argument == "--translation-model") {
+            const NativeCharacter* value = next();
+            if (value == nullptr) {
+                return std::nullopt;
+            }
+            options.translation_model = std::filesystem::path(value);
         } else if (argument == "--help" || argument == "-h") {
             return std::nullopt;
         } else {
@@ -339,6 +388,7 @@ void print_event(const RecognitionEvent& event, std::mutex& output_mutex) {
         std::cout << ",\"audio_ms\":" << event.audio_ms
                   << ",\"vad_ms\":" << event.vad_ms
                   << ",\"inference_ms\":" << event.inference_ms
+                  << ",\"final_latency_ms\":" << event.final_latency_ms
                   << ",\"text\":\"" << json_escape(event.text) << "\""
                   << ",\"stable\":\"" << json_escape(event.stable) << "\""
                   << ",\"unstable\":\"" << json_escape(event.unstable) << "\""
@@ -405,7 +455,9 @@ void translate_final(
         std::chrono::steady_clock::now() - started).count();
     std::scoped_lock lock(output_mutex);
     std::cout << "{\"event\":\"translation\",\"sequence\":" << event.sequence
-              << ",\"translation_ms\":" << elapsed_ms;
+              << ",\"translation_ms\":" << elapsed_ms
+              << ",\"backend\":\"" << json_escape(std::string(translator.backend_name()))
+              << "\",\"device\":\"" << json_escape(translator.device_label()) << "\"";
     if (translation.has_value()) {
         std::cout << ",\"text\":\"" << json_escape(*translation) << "\"";
     } else {
@@ -485,8 +537,9 @@ int main(int argc, char** argv) {
     std::string error;
     const auto load_started = std::chrono::steady_clock::now();
     const bool loaded = options->whisper_model.empty()
-        ? sensevoice.load(options->model, options->threads, error)
-        : whisper.load(options->whisper_model, options->language, options->threads, error);
+        ? sensevoice.load(options->model, options->threads, error, options->compute)
+        : whisper.load(options->whisper_model, options->language, options->threads, error,
+                       options->compute);
     if (!loaded) {
         std::cerr << error << '\n';
         return 1;
@@ -496,17 +549,29 @@ int main(int argc, char** argv) {
     engine.set_language(options->language);
     const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - load_started).count();
-    std::cerr << "SenseVoice loaded on " << engine.device() << " in " << load_ms << " ms\n";
+    std::cerr << "Speech engine loaded on " << engine.device() << " in " << load_ms << " ms\n";
 
     FsmnVadEngine vad;
     const auto vad_load_started = std::chrono::steady_clock::now();
-    if (!vad.load(options->vad, options->threads, error)) {
+    // VAD runs concurrently with ASR by default, so it gets a smaller pool
+    // than the recognizer rather than competing for all CPU cores.
+    const int vad_threads = options->vad_threads > 0
+        ? options->vad_threads
+        : std::min(4, options->threads);
+    if (!vad.load(options->vad, vad_threads, error)) {
         std::cerr << error << '\n';
         return 1;
     }
     const auto vad_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - vad_load_started).count();
-    std::cerr << "FSMN-VAD loaded in " << vad_load_ms << " ms\n";
+    const char* serial_vad = std::getenv("SENSEVOICE_SERIAL_VAD");
+    const bool serial_pipeline =
+        serial_vad != nullptr && serial_vad[0] != '\0' && std::string(serial_vad) != "0";
+    std::cerr << "FSMN-VAD loaded in " << vad_load_ms << " ms (" << vad_threads
+              << " threads, " << (serial_pipeline ? "serial" : "overlapped")
+              << " pipeline)\n";
+    std::cerr << "fbank: " << (fbank::serial_forced() ? "serial" : "parallel")
+              << " feature extraction\n";
 
     std::mutex output_mutex;
     TextProcessor text_processor;
@@ -559,18 +624,33 @@ int main(int argc, char** argv) {
     std::unique_ptr<Translator> translator;
     std::optional<TranslationSession> translation_session;
     if (options->translate.has_value()) {
-        const std::filesystem::path models = options->translation_models.value_or(
-            executable_directory / "models");
+        const std::filesystem::path default_models =
+            std::filesystem::exists(executable_directory / "modelspt")
+                ? executable_directory / "modelspt"
+                : executable_directory / "models";
+        const std::filesystem::path models = options->translation_models.value_or(default_models);
+        // Translation has its own device policy. Without --translation-device
+        // it follows --device, so existing command lines keep their meaning.
+        // The runtime then picks Opus-MT CUDA for zh-en/en-zh and Qwen for the
+        // other directions, and never falls back to the CPU under `gpu`.
+        const ComputePolicy translation_compute =
+            options->translation_compute.value_or(options->compute);
+        const auto selected_model = options->translation_model;
+        const TranslatorFactory factory = make_translation_factory(
+            models,
+            [selected_model] { return selected_model.value_or(std::filesystem::path()); },
+            options->threads, translation_compute, detect_gpu_capability());
         const auto translator_load_started = std::chrono::steady_clock::now();
-        translator = make_default_translation_factory(models, options->threads)(*options->translate, error);
+        translator = factory(*options->translate, error);
         if (!translator) {
-            std::cerr << error << '\n';
+            std::cerr << "translation load failed: " << error << '\n';
             return 1;
         }
         const auto translator_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - translator_load_started).count();
-        std::cerr << "Translator " << direction_code(*options->translate) << " loaded in "
-                  << translator_load_ms << " ms\n";
+        std::cerr << "Translator " << direction_code(*options->translate) << " ("
+                  << translator->backend_name() << ") loaded on "
+                  << translator->device_label() << " in " << translator_load_ms << " ms\n";
         translation_session.emplace(*options->translate);
     }
     StreamRecognizer recognizer(

@@ -30,6 +30,8 @@ struct WhisperEngine::Impl {
     int threads = 4;
     bool gpu = false;
     bool neural_engine = false;
+    GpuCapability capability;
+    std::string device_label = "CPU (Whisper)";
 
     ~Impl() {
         if (context != nullptr) whisper_free(context);
@@ -40,14 +42,21 @@ WhisperEngine::WhisperEngine() : impl_(std::make_unique<Impl>()) {}
 WhisperEngine::~WhisperEngine() = default;
 
 bool WhisperEngine::load(const std::filesystem::path& model_path, std::string language,
-                         int threads, std::string& error) {
+                         int threads, std::string& error, ComputePolicy policy) {
     silence_logs();
     if (!std::filesystem::is_regular_file(model_path)) {
         error = "missing Whisper model " + model_path.string();
         return false;
     }
+    const ComputeResolution resolution =
+        resolve_compute(policy, detect_gpu_capability());
+    if (!resolution.ok()) {
+        error = resolution.error;
+        return false;
+    }
+    impl_->capability = detect_gpu_capability();
     whisper_context_params params = whisper_context_default_params();
-    params.use_gpu = true;
+    params.use_gpu = resolution.device == ComputeDevice::Gpu;
     params.flash_attn = true;
     impl_->context = whisper_init_from_file_with_params(model_path.string().c_str(), params);
     if (impl_->context == nullptr) {
@@ -56,17 +65,31 @@ bool WhisperEngine::load(const std::filesystem::path& model_path, std::string la
     }
     impl_->language = language.empty() ? "auto" : std::move(language);
     impl_->threads = std::max(1, threads);
+    impl_->gpu = params.use_gpu;
 #ifdef __APPLE__
-    impl_->gpu = true;
-    // whisper.cpp picks up the Core ML encoder from this exact name.
-    std::filesystem::path encoder = model_path;
-    encoder.replace_extension();
-    std::string stem = encoder.string();
-    for (const char* suffix : {"-q5_0", "-q5_1", "-q8_0"}) {
-        if (stem.ends_with(suffix)) stem.erase(stem.size() - std::string(suffix).size());
+    if (impl_->gpu) {
+        // whisper.cpp picks up the Core ML encoder from this exact name.
+        std::filesystem::path encoder = model_path;
+        encoder.replace_extension();
+        std::string stem = encoder.string();
+        for (const char* suffix : {"-q5_0", "-q5_1", "-q8_0"}) {
+            if (stem.ends_with(suffix)) stem.erase(stem.size() - std::string(suffix).size());
+        }
+        impl_->neural_engine = std::filesystem::exists(stem + "-encoder.mlmodelc");
     }
-    impl_->neural_engine = std::filesystem::exists(stem + "-encoder.mlmodelc");
 #endif
+    if (impl_->neural_engine) {
+        impl_->device_label = "Neural Engine + GPU (Whisper)";
+    } else if (impl_->gpu) {
+        // Name the real backend (CUDA on Windows/Linux, Metal on macOS)
+        // instead of assuming Metal.
+        std::string label =
+            compute_device_label(ComputeDevice::Gpu, impl_->capability);
+        label.insert(label.size() - 1, ", Whisper");
+        impl_->device_label = std::move(label);
+    } else {
+        impl_->device_label = "CPU (Whisper)";
+    }
     return true;
 }
 
@@ -75,8 +98,7 @@ bool WhisperEngine::loaded() const {
 }
 
 const char* WhisperEngine::device() const {
-    if (impl_->neural_engine) return "Neural Engine + GPU (Whisper)";
-    return impl_->gpu ? "GPU (Metal, Whisper)" : "CPU (Whisper)";
+    return impl_->device_label.c_str();
 }
 
 void WhisperEngine::set_language(const std::string& language) {

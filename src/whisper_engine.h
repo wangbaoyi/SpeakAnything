@@ -1,5 +1,6 @@
 #pragma once
 
+#include "compute_policy.h"
 #include "sensevoice_engine.h"
 
 #include <filesystem>
@@ -19,8 +20,10 @@ public:
     WhisperEngine& operator=(const WhisperEngine&) = delete;
 
     // language: ISO 639-1 code ("bg", "de"...), or "auto".
+    // policy follows SenseVoiceEngine::load: Auto prefers a GPU, Cpu never uses
+    // one, and Gpu fails when the build or machine has no GPU.
     bool load(const std::filesystem::path& model_path, std::string language, int threads,
-              std::string& error);
+              std::string& error, ComputePolicy policy = ComputePolicy::Auto);
     [[nodiscard]] bool loaded() const override;
     using SpeechEngine::recognize;
     // Hotwords bias Whisper through its initial prompt.

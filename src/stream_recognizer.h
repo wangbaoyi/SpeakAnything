@@ -10,7 +10,9 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -26,6 +28,9 @@ struct RecognitionEvent {
     int audio_ms = 0;
     int vad_ms = 0;
     int inference_ms = 0;
+    // Milliseconds from the most recent accept_pcm to this final event. Zero
+    // for partials and for finals emitted without any accepted audio.
+    int final_latency_ms = 0;
     float vad_current_db = -100.0F;
     float vad_peak_db = -100.0F;
     float vad_noise_floor_db = -70.0F;
@@ -82,7 +87,23 @@ public:
     [[nodiscard]] VadResult vad_telemetry() const;
 
 private:
+    // Immutable output of one VAD pass. `audio_samples` is the prefix length
+    // of the audio buffer at the moment the pass started. `generation` changes
+    // whenever consume_audio_prefix shifts the buffer, so a result from an
+    // older generation can never be applied to newer audio.
+    struct VadSnapshot {
+        std::uint64_t generation = 0;
+        std::uint64_t revision = 0;
+        std::size_t audio_samples = 0;
+        VadResult result;
+    };
+
     void run();
+    void run_serial();
+    void run_overlapped();
+    void run_vad_worker();
+    VadDetectionOptions vad_options() const;
+    bool fresh_vad_available() const;
     SenseVoiceResult recognize_snapshot(
         std::span<const float> snapshot,
         const VadResult* detected_vad = nullptr,
@@ -101,13 +122,39 @@ private:
     StabilityTracker stability_;
 
     std::mutex mutex_;
+    // Serializes start/finish/cancel so two callers cannot join the same
+    // std::thread concurrently.
+    mutable std::mutex lifecycle_mutex_;
     std::condition_variable condition_;
+    std::condition_variable vad_condition_;
     std::vector<float> audio_;
     std::thread worker_;
+    std::thread vad_worker_;
     bool started_ = false;
     bool dirty_ = false;
     bool finish_requested_ = false;
     bool cancel_requested_ = false;
+    bool serial_vad_ = false;
+    // Set by the recognizer worker as it returns. The VAD worker stays alive
+    // until then so a trim during the last partial can still be served.
+    bool asr_done_ = false;
+    // Monotonic revision of the audio buffer, bumped on every append and every
+    // consume. VAD results record the revision they were computed from.
+    std::uint64_t audio_revision_ = 0;
+    // Bumped whenever consume_audio_prefix shifts the buffer. Segment times are
+    // relative to the buffer start, so results from an older generation are
+    // discarded rather than reinterpreted.
+    std::uint64_t audio_generation_ = 1;
+    std::uint64_t finish_revision_ = 0;
+    bool vad_requested_ = false;
+    // Buffer length when the newest VAD pass started. accept_pcm only asks for
+    // another pass once enough new audio has arrived, so the worker does not
+    // scan every capture chunk of a growing utterance.
+    std::size_t last_vad_pass_samples_ = 0;
+    std::optional<VadSnapshot> vad_result_;
+    std::uint64_t last_vad_revision_consumed_ = 0;
+    std::string vad_error_;
+    std::atomic<std::int64_t> last_accept_ns_{0};
     std::size_t last_decoded_samples_ = 0;
     std::string last_text_;
     int last_vad_ms_ = 0;

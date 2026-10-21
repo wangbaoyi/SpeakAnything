@@ -62,6 +62,17 @@ bool copy_directory(const QString& source, const QString& destination) {
     return true;
 }
 
+QString kind_folder(ModelKind kind) {
+    const std::string_view folder = model_kind_folder(kind);
+    return QString::fromUtf8(folder.data(), static_cast<qsizetype>(folder.size()));
+}
+
+// Downloads live in category folders: modelspt/recognizer/...,
+// modelspt/translator/... and modelspt/voice/....
+QString part_destination(const QString& root, const CatalogModel& model, const ModelPart& part) {
+    return QDir(root).filePath(kind_folder(model.kind) + QLatin1Char('/') + to_qstring(part.destination));
+}
+
 bool part_applies(const ModelPart& part) {
 #ifdef __APPLE__
     (void)part;
@@ -76,12 +87,57 @@ bool part_applies(const ModelPart& part) {
 ModelManager::ModelManager(QString bundled_directory, QObject* parent)
     : QObject(parent),
       bundled_directory_(std::move(bundled_directory)),
-      // ~/Library/Application Support/SpeakAnything/models, or
-      // %LOCALAPPDATA%/SpeakAnything/models on Windows.
+      // Older builds kept their models in a sibling models/ directory.
+      legacy_directory_(QFileInfo(bundled_directory_).absoluteDir().filePath(QStringLiteral("models"))),
+      // Fallback downloads: ~/Library/Application Support/SpeakAnything/models,
+      // or %LOCALAPPDATA%/SpeakAnything/models on Windows.
       user_directory_(QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
                           .filePath(QStringLiteral("SpeakAnything/models"))),
+      legacy_user_directory_(user_directory_),
       network_(new QNetworkAccessManager(this)) {
-    QDir().mkpath(user_directory_);
+    // Keep everything in modelspt when the executable directory is writable.
+    // Installs under Program Files fall back to the per-user directory.
+    QDir().mkpath(bundled_directory_);
+    if (QFileInfo(bundled_directory_).isDir() && QFileInfo(bundled_directory_).isWritable()) {
+        user_directory_ = QDir(bundled_directory_).absolutePath();
+    } else {
+        QDir().mkpath(user_directory_);
+    }
+}
+
+QStringList ModelManager::searchRoots() const {
+    QStringList roots;
+    const auto add = [&roots](const QString& directory) {
+        if (directory.isEmpty()) return;
+        const QString clean = QDir::cleanPath(directory);
+        if (!roots.contains(clean)) roots.push_back(clean);
+    };
+    add(bundled_directory_);
+    add(custom_directory_);
+    add(legacy_directory_);
+    add(user_directory_);
+    add(legacy_user_directory_);
+    return roots;
+}
+
+void ModelManager::setCustomDirectory(const QString& directory) {
+    custom_directory_ = directory.isEmpty() ? QString() : QDir::cleanPath(directory);
+}
+
+void ModelManager::setCustomPath(const QString& id, const QString& path) {
+    if (path.isEmpty()) {
+        custom_paths_.remove(id);
+    } else {
+        custom_paths_.insert(id, QDir::cleanPath(path));
+    }
+}
+
+void ModelManager::clearCustomPath(const QString& id) {
+    custom_paths_.remove(id);
+}
+
+void ModelManager::clearCustomPaths() {
+    custom_paths_.clear();
 }
 
 ModelManager::~ModelManager() {
@@ -92,9 +148,34 @@ ModelManager::~ModelManager() {
 QString ModelManager::locate(const CatalogModel& model) const {
     // System voices have no files; the marker stands in for a path.
     if (model.engine == ModelEngine::SystemVoice) return QStringLiteral("system");
-    for (const QString& root : {user_directory_, bundled_directory_}) {
-        const QString path = QDir(root).filePath(to_qstring(model.path));
-        if (QFileInfo::exists(path)) return path;
+    const QString id = to_qstring(model.id);
+    const auto custom = custom_paths_.constFind(id);
+    if (custom != custom_paths_.constEnd() && QFileInfo::exists(custom.value())) {
+        return custom.value();
+    }
+    const QString relative = to_qstring(model.path);
+    const QString basename = relative.section(QLatin1Char('/'), -1);
+    const QString folder = kind_folder(model.kind);
+    const bool directory_model =
+        model.engine == ModelEngine::Kokoro || model.engine == ModelEngine::Piper;
+    for (const QString& root : searchRoots()) {
+        const QDir base(root);
+        // New layout: modelspt/<recognizer|translator|voice>/...
+        const QString categorised = base.filePath(folder + QLatin1Char('/') + relative);
+        if (QFileInfo::exists(categorised)) return categorised;
+        // Older flat layout, also used by the legacy models directory.
+        const QString flat_path = base.filePath(relative);
+        if (QFileInfo::exists(flat_path)) return flat_path;
+        // Downloads often keep only the file name (for example a Whisper
+        // ggml-*.bin dropped straight into a category folder). Directory
+        // models such as Kokoro or Piper need their folder, so do not
+        // flatten those.
+        if (relative.contains(QLatin1Char('/')) && !directory_model) {
+            const QString flat_categorised = base.filePath(folder + QLatin1Char('/') + basename);
+            if (QFileInfo::exists(flat_categorised)) return flat_categorised;
+            const QString flat_root = base.filePath(basename);
+            if (QFileInfo::exists(flat_root)) return flat_root;
+        }
     }
     return {};
 }
@@ -102,9 +183,33 @@ QString ModelManager::locate(const CatalogModel& model) const {
 QString ModelManager::locateDirectory(const CatalogModel& model) const {
     const QString path = locate(model);
     if (path.isEmpty() || model.engine == ModelEngine::SystemVoice) return path;
+    const QFileInfo info(path);
+
+    // A user-imported path is exactly what the user chose: the folder for a
+    // directory model, or the parent folder of an imported model file.
+    const auto custom = custom_paths_.constFind(to_qstring(model.id));
+    if (custom != custom_paths_.constEnd() && custom.value() == path) {
+        return info.isDir() ? info.absoluteFilePath() : info.absolutePath();
+    }
+
     const QString relative = to_qstring(model.path);
     const QString first = relative.section(QLatin1Char('/'), 0, 0);
-    return path.left(path.size() - relative.size()) + first;
+    const QString basename = relative.section(QLatin1Char('/'), -1);
+    const QString kind = kind_folder(model.kind);
+    for (const QString& root : searchRoots()) {
+        const QDir base(root);
+        for (const QString& prefix : {kind + QLatin1Char('/'), QString()}) {
+            if (path == base.filePath(prefix + relative)) {
+                const QString folder = base.filePath(prefix + first);
+                if (QFileInfo::exists(folder)) return folder;
+                return info.absolutePath();
+            }
+            if (relative.contains(QLatin1Char('/')) && path == base.filePath(prefix + basename)) {
+                return info.absolutePath();
+            }
+        }
+    }
+    return info.isDir() ? info.absoluteFilePath() : info.absolutePath();
 }
 
 bool ModelManager::installed(const CatalogModel& model) const {
@@ -131,21 +236,32 @@ void ModelManager::cancel(const QString& id) {
 }
 
 bool ModelManager::remove(const CatalogModel& model) {
+    // Never delete a user-imported file or folder. Removing the entry just
+    // stops the app from using it.
+    const QString id = to_qstring(model.id);
+    if (custom_paths_.contains(id)) {
+        clearCustomPath(id);
+        return true;
+    }
     if (model.bundled && !QFileInfo::exists(QDir(user_directory_).filePath(to_qstring(model.path)))) {
         return false;
     }
     bool ok = true;
     for (const ModelPart& part : model.parts) {
-        if (part.archive == ArchiveKind::File) {
-            QFile::remove(QDir(user_directory_).filePath(to_qstring(part.destination)));
-        }
+        if (part.archive != ArchiveKind::File) continue;
+        QFile::remove(part_destination(user_directory_, model, part));
+        // A previous build may have downloaded this one to the root.
+        QFile::remove(QDir(user_directory_).filePath(to_qstring(part.destination)));
     }
-    // Directory models: drop the folder that holds the marker path.
+    // Directory models: drop the folder that holds the marker path. Whisper
+    // models share one folder, so never remove that shared directory.
     const QString relative = to_qstring(model.path);
     if (relative.contains(QLatin1Char('/'))) {
-        const QString folder = QDir(user_directory_).filePath(relative.section(QLatin1Char('/'), 0, 0));
-        if (folder != QDir(user_directory_).filePath(QStringLiteral("whisper"))) {
-            ok = QDir(folder).removeRecursively();
+        const QString first = relative.section(QLatin1Char('/'), 0, 0);
+        if (first == QStringLiteral("whisper")) return ok;
+        for (const QString& root : {QDir(user_directory_).filePath(kind_folder(model.kind)),
+                                    user_directory_}) {
+            ok = QDir(QDir(root).filePath(first)).removeRecursively() && ok;
         }
     }
     return ok;
@@ -222,7 +338,7 @@ void ModelManager::partDownloaded() {
     const CatalogModel* model = find_model(job_->id.toStdString());
     const ModelPart& part = model->parts[job_->part];
     completed_bytes_ += QFileInfo(temporary).size();
-    const QString destination = QDir(user_directory_).filePath(to_qstring(part.destination));
+    const QString destination = part_destination(user_directory_, *model, part);
 
     if (part.archive == ArchiveKind::File) {
         QDir().mkpath(QFileInfo(destination).absolutePath());
@@ -283,11 +399,12 @@ void ModelManager::emitProgress(qint64 received) {
 
 QString ModelManager::importPiper(const CatalogModel& model) const {
     const QString relative = to_qstring(model.path);
-    const QString folder = QDir(user_directory_).filePath(relative.section(QLatin1Char('/'), 0, 0));
+    const QString folder = QDir(QDir(user_directory_).filePath(kind_folder(model.kind)))
+                               .filePath(relative.section(QLatin1Char('/'), 0, 0));
     QString onnx_path;
     QString json_path;
     for (const ModelPart& part : model.parts) {
-        const QString path = QDir(user_directory_).filePath(to_qstring(part.destination));
+        const QString path = part_destination(user_directory_, model, part);
         (path.endsWith(QStringLiteral(".json")) ? json_path : onnx_path) = path;
     }
     QFile json_file(json_path);

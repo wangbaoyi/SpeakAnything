@@ -23,8 +23,18 @@ public:
     OpusMtTranslator(
         std::unique_ptr<ctranslate2::Translator> model,
         std::unique_ptr<sentencepiece::SentencePieceProcessor> source,
-        std::unique_ptr<sentencepiece::SentencePieceProcessor> target)
-        : model_(std::move(model)), source_(std::move(source)), target_(std::move(target)) {}
+        std::unique_ptr<sentencepiece::SentencePieceProcessor> target,
+        bool cuda,
+        std::string device_label)
+        : model_(std::move(model)), source_(std::move(source)), target_(std::move(target)),
+          cuda_(cuda), device_label_(std::move(device_label)) {}
+
+    std::string_view backend_name() const override {
+        // Name the compute type too: CUDA runs FLOAT32, the CPU path INT8.
+        return cuda_ ? "Opus-MT (CTranslate2 CUDA FP32)"
+                     : "Opus-MT (CTranslate2 CPU INT8)";
+    }
+    std::string device_label() const override { return device_label_; }
 
     std::optional<std::string> translate(std::string_view text, std::string& error) override {
         try {
@@ -62,6 +72,8 @@ private:
     std::unique_ptr<ctranslate2::Translator> model_;
     std::unique_ptr<sentencepiece::SentencePieceProcessor> source_;
     std::unique_ptr<sentencepiece::SentencePieceProcessor> target_;
+    bool cuda_ = false;
+    std::string device_label_ = "CPU";
 };
 
 std::unique_ptr<sentencepiece::SentencePieceProcessor> load_spm(
@@ -77,14 +89,29 @@ std::unique_ptr<sentencepiece::SentencePieceProcessor> load_spm(
 
 }  // namespace
 
-TranslatorFactory make_opus_mt_factory(std::filesystem::path models_directory, int threads) {
-    return [models_directory = std::move(models_directory), threads](
+TranslatorFactory make_opus_mt_factory(
+    std::filesystem::path models_directory,
+    int threads,
+    ComputeDevice device,
+    std::string device_label) {
+    return [models_directory = std::move(models_directory), threads, device,
+            device_label = std::move(device_label)](
                TranslationDirection direction, std::string& error) -> std::unique_ptr<Translator> {
         const auto directory = opus_mt_model_directory(models_directory, direction);
         if (!std::filesystem::exists(directory / "model.bin")) {
             error = "translation model not found: " + utf8_path(directory);
             return nullptr;
         }
+        const bool use_cuda = device == ComputeDevice::Gpu;
+#ifndef SENSEVOICE_CT2_CUDA
+        if (use_cuda) {
+            // Never run the CPU model under a GPU label.
+            error =
+                "Opus-MT on the GPU needs a CTranslate2 CUDA build "
+                "(configure with -DSENSEVOICE_CT2_CUDA=ON)";
+            return nullptr;
+        }
+#endif
         auto source = load_spm(directory / "source.spm", error);
         if (!source) return nullptr;
         auto target = load_spm(directory / "target.spm", error);
@@ -92,15 +119,37 @@ TranslatorFactory make_opus_mt_factory(std::filesystem::path models_directory, i
         try {
             ctranslate2::ReplicaPoolConfig config;
             config.num_threads_per_replica = static_cast<std::size_t>(threads > 0 ? threads : 0);
-            auto model = std::make_unique<ctranslate2::Translator>(
-                utf8_path(directory),
-                ctranslate2::Device::CPU,
-                ctranslate2::ComputeType::INT8,
-                std::vector<int>{0},
-                false,
-                config);
+            std::unique_ptr<ctranslate2::Translator> model;
+            if (use_cuda) {
+#ifdef SENSEVOICE_CT2_CUDA
+                // Pascal has no fast INT8 path in CTranslate2; FLOAT32 was the
+                // fastest measured option on the GTX 1080 Ti.
+                model = std::make_unique<ctranslate2::Translator>(
+                    utf8_path(directory),
+                    ctranslate2::Device::CUDA,
+                    ctranslate2::ComputeType::FLOAT32,
+                    std::vector<int>{0},
+                    false,
+                    config);
+#endif
+            } else {
+                model = std::make_unique<ctranslate2::Translator>(
+                    utf8_path(directory),
+                    ctranslate2::Device::CPU,
+                    ctranslate2::ComputeType::INT8,
+                    std::vector<int>{0},
+                    false,
+                    config);
+            }
+            if (!model) {
+                error = "Opus-MT CUDA support was not compiled into this build";
+                return nullptr;
+            }
+            const std::string label = device_label.empty()
+                ? (use_cuda ? std::string("GPU (CUDA)") : std::string("CPU"))
+                : device_label;
             auto translator = std::make_unique<OpusMtTranslator>(
-                std::move(model), std::move(source), std::move(target));
+                std::move(model), std::move(source), std::move(target), use_cuda, label);
             // Warm up so inference buffers are resident before any recording
             // session samples its working-set baseline.
             std::string warmup_error;
@@ -116,7 +165,8 @@ TranslatorFactory make_opus_mt_factory(std::filesystem::path models_directory, i
 
 #else
 
-TranslatorFactory make_opus_mt_factory(std::filesystem::path, int) {
+TranslatorFactory make_opus_mt_factory(
+    std::filesystem::path, int, ComputeDevice, std::string) {
     return [](TranslationDirection, std::string& error) -> std::unique_ptr<Translator> {
         error = "this build was compiled without translation support";
         return nullptr;

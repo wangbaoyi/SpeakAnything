@@ -4,7 +4,7 @@
 #   tools/package_macos.sh [version]
 #
 # Needs: Qt 6.8+ (macdeployqt), CMake, Ninja, the models listed in
-# README.en.md under models/, and sherpa-onnx in third_party/sherpa-onnx-macos.
+# README.en.md under modelspt/, and sherpa-onnx in third_party/sherpa-onnx-macos.
 # Signs ad hoc unless CODESIGN_IDENTITY names a Developer ID certificate.
 set -eu
 
@@ -16,13 +16,21 @@ qt_prefix="${QT_PREFIX:-$(brew --prefix qt 2>/dev/null || true)}"
 identity="${CODESIGN_IDENTITY:--}"
 
 require() {
-    [ -e "$root/$1" ] || { echo "missing $1 (see README.en.md, Models)" >&2; exit 1; }
+    [ -e "$1" ] || { echo "missing $1 (see README.en.md, Models)" >&2; exit 1; }
 }
-require models/sensevoice-small-q8.gguf
-require models/fsmn-vad.gguf
-require models/qwen3-1.7b-q4_k_m.gguf
-require models/kokoro-multi-lang-v1_1/model.onnx
-require third_party/sherpa-onnx-macos/lib/libsherpa-onnx-c-api.dylib
+models_dir="${MODELS_DIR:-$root/modelspt}"
+[ -d "$models_dir" ] || models_dir="$root/models"
+require_model() {
+    [ -e "$models_dir/$1/$2" ] || [ -e "$models_dir/$2" ] || {
+        echo "missing $2 (looked in $models_dir/$1 and $models_dir; see README.en.md, Models)" >&2
+        exit 1
+    }
+}
+require_model recognizer sensevoice-small-q8.gguf
+require_model recognizer fsmn-vad.gguf
+require_model translator qwen3-1.7b-q4_k_m.gguf
+require_model voice kokoro-multi-lang-v1_1/model.onnx
+require "$root/third_party/sherpa-onnx-macos/lib/libsherpa-onnx-c-api.dylib"
 
 cmake -S "$root" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$qt_prefix" -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0
@@ -33,13 +41,17 @@ contents="$app/Contents"
 resources="$contents/Resources"
 frameworks="$contents/Frameworks"
 # Start from an empty models folder so nothing from an earlier build lingers.
-rm -rf "$resources/models"
-mkdir -p "$resources/models" "$resources/dict" "$frameworks"
+rm -rf "$resources/modelspt"
+mkdir -p "$resources/modelspt" "$resources/dict" "$frameworks"
 
 echo "Copying models..."
 # Only the basic models ship; the rest download from Settings > Models.
+for category in recognizer translator voice; do
+    [ -d "$models_dir/$category" ] && rsync -a --delete "$models_dir/$category" "$resources/modelspt/"
+done
+# Flat layouts from older installs.
 for item in sensevoice-small-q8.gguf fsmn-vad.gguf qwen3-1.7b-q4_k_m.gguf kokoro-multi-lang-v1_1; do
-    rsync -a --delete "$root/models/$item" "$resources/models/"
+    [ -e "$models_dir/$item" ] && rsync -a --delete "$models_dir/$item" "$resources/modelspt/"
 done
 cp "$root/third_party/cppjieba/dict/jieba.dict.utf8" "$root/third_party/cppjieba/dict/user.dict.utf8" \
     "$resources/dict/"

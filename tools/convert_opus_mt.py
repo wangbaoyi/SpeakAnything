@@ -1,9 +1,9 @@
-"""Convert the Opus-MT zh/en models into int8 CTranslate2 models under models/.
+"""Convert the Opus-MT zh/en models into int8 CTranslate2 models under modelspt/translator/.
 
 Developer-machine only; end users receive the converted directories.
 
     python -m pip install ctranslate2 transformers sentencepiece torch
-    python tools/convert_opus_mt.py [--output models]
+    python tools/convert_opus_mt.py [--output modelspt/translator]
 """
 
 import argparse
@@ -43,7 +43,7 @@ def convert(source: str, destination: pathlib.Path, force: bool) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     root = pathlib.Path(__file__).resolve().parent.parent
-    parser.add_argument("--output", type=pathlib.Path, default=root / "models")
+    parser.add_argument("--output", type=pathlib.Path, default=root / "modelspt" / "translator")
     parser.add_argument("--force", action="store_true", help="reconvert existing models")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
