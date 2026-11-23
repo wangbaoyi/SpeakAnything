@@ -206,6 +206,27 @@ VAD 页拆为“句尾判定”和“噪声判定”两张卡：句尾静音、�
 
 产物位于 `.codex-temp/ui-baseline-finish/`；该轮 `ctest` 12/12 通过。
 
+## 侧栏扁平导航
+
+移除侧栏的四个分组标题（语音输入、语音能力、资源、个性化），只保留 8 个可点击页面项：输入、输出、VAD、翻译、朗读、热词、模型、外观。键盘 Up/Down 仍按页面顺序移动，Home/End 仍跳到首尾；页面映射和选中强调条不变。
+
+`settings-ui-test` 的侧栏键盘断言同步更新。`ctest` 13/13 通过，耗时 1.59 s。
+
+与 `ui-baseline-finish` 对比：变化集中在侧栏区域；page 0 另有首个下拉框焦点描边的生成时机差异，page 6 为环境相关模型状态。
+
+| 文件 | 字节 | SHA-256 |
+| --- | --- | --- |
+| `settings-0.png` | 10329 | `2C02BB097575E976A0A2653C62342A418A05D1FBCB620A84EC6482CED5C0DF30` |
+| `settings-1.png` | 10695 | `D11307CAC14D9A84617819E487DE92AEDA71A8F2DD09AE9EE3ABD3DD7EAB31FB` |
+| `settings-2.png` | 10726 | `903861C8F1F2B02DD90AADBE20A931DE14EC6692AF5D1D394FDF3CCFFBD5AA22` |
+| `settings-3.png` | 10212 | `919B5E6A223D5199EDF872B4A3654A6C3E61D7365E658978868D169BB97346FC` |
+| `settings-4.png` | 10581 | `262D1AC55BED852B772EA97DB797475B23AEFD14BBE0665ADF3982FF004AA8B0` |
+| `settings-5.png` | 7533 | `CD746B5A2ECF78EFF94ED023728F6FAD7740A3B3A842A42342EA642E68883297` |
+| `settings-6.png` | 9930 | `F6E74EE9A08A1A914010E74FB47BCDDDCFB323C0B39DEAE629C7A774DDD3E2D6` |
+| `settings-7.png` | 9939 | `F28F9E518B7DB67D30714E8F0955B3E8543224FE3A002C7A273B6BCCDB3815AA` |
+
+产物位于 `.codex-temp/ui-baseline-flat-nav/`；该轮 `ctest` 13/13 通过。
+
 ## 翻译目录与检查
 
 `lupdate` 刷新后新增 79 条字符串、移除 7 条 vanished；补齐英文后目录为 299 条消息、单一 `SpeakAnything` 上下文、0 unfinished、0 vanished。`lrelease` 生成 299 条已完成翻译的 `speakanything_en.qm`。

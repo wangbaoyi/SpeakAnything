@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
         check(settingsCurrentPageForTest(dialog) == 2, "end selects the last page");
         QKeyEvent up(QEvent::KeyPress, Qt::Key_Up, Qt::NoModifier);
         QApplication::sendEvent(sidebar, &up);
-        check(settingsCurrentPageForTest(dialog) == 6, "up skips group headings");
+        check(settingsCurrentPageForTest(dialog) == 6, "up moves to the previous page");
         QKeyEvent home(QEvent::KeyPress, Qt::Key_Home, Qt::NoModifier);
         QApplication::sendEvent(sidebar, &home);
         check(settingsCurrentPageForTest(dialog) == 0, "home selects the first page");

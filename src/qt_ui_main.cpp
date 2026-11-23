@@ -1596,29 +1596,17 @@ public:
             }
         }
 
-        const auto add_group = [sidebar](const QString& title) {
-            auto* item = new QListWidgetItem(title, sidebar);
-            item->setFlags(Qt::NoItemFlags);
-            QFont group_font = item->font();
-            group_font.setWeight(QFont::DemiBold);
-            item->setFont(group_font);
-            item->setForeground(color(ColorRole::TextMuted));
-        };
         const auto add_page_item = [sidebar](const QString& title, int page) {
             auto* item = new QListWidgetItem(title, sidebar);
             item->setData(Qt::UserRole, page);
         };
-        add_group(Ui::tr("语音输入"));
         add_page_item(Ui::tr("输入"), 0);
         add_page_item(Ui::tr("输出"), 1);
         add_page_item(QStringLiteral("VAD"), 7);
-        add_group(Ui::tr("语音能力"));
         add_page_item(Ui::tr("翻译"), 3);
         add_page_item(Ui::tr("朗读"), 4);
-        add_group(Ui::tr("资源"));
         add_page_item(Ui::tr("热词"), 5);
         add_page_item(Ui::tr("模型"), 6);
-        add_group(Ui::tr("个性化"));
         add_page_item(Ui::tr("外观"), 2);
 
         connect(sidebar, &QListWidget::currentRowChanged, this, [this](int row) {
