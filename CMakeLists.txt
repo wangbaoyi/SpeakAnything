@@ -370,15 +370,21 @@ if(WIN32)
     set_property(TARGET OpenLessIme PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-    add_executable(sensevoice-ui WIN32
+    set(SENSEVOICE_UI_SOURCES
         src/audio_io.cpp
         src/model_catalog.cpp
         src/model_manager.cpp
         src/models_page.cpp
-        src/qt_ui_main.cpp
         src/speech_player.cpp
         src/speech_queue.cpp
+        src/ui/design_tokens.cpp
+        src/ui/overlay_theme.cpp
+        src/ui/settings_types.cpp
         src/windows_text_injector.cpp
+    )
+    add_executable(sensevoice-ui WIN32
+        ${SENSEVOICE_UI_SOURCES}
+        src/qt_ui_main.cpp
         resources/sensevoice.qrc
         resources/sensevoice.rc
     )
@@ -406,6 +412,39 @@ if(WIN32)
     # The manifest resource declares UTF-8 as the active code page so vendored
     # C libraries can open model paths that contain non-ASCII characters.
     target_link_options(sensevoice-ui PRIVATE /MANIFEST:NO)
+
+    # Verification harness for the settings dialog. It compiles the UI without
+    # its entry point and links the test-only hooks in qt_ui_main.cpp.
+    add_executable(settings-ui-test
+        tests/settings_ui_test.cpp
+        ${SENSEVOICE_UI_SOURCES}
+        src/qt_ui_main.cpp
+    )
+    target_include_directories(settings-ui-test PRIVATE
+        src
+        third_party/FunASR/runtime/llama.cpp/funasr-common
+    )
+    target_compile_definitions(settings-ui-test PRIVATE
+        SENSEVOICE_UI_TESTING NOMINMAX _USE_MATH_DEFINES UNICODE _UNICODE)
+    target_compile_options(settings-ui-test PRIVATE /utf-8 /W4 /permissive-)
+    target_link_libraries(settings-ui-test PRIVATE
+        sensevoice_core
+        sensevoice_translation
+        Qt6::Widgets
+        Qt6::Network
+        psapi
+        ole32
+        oleaut32
+        uiautomationcore
+        uuid
+        winmm
+        mfplat
+        mfreadwrite
+        mfuuid
+    )
+    add_test(NAME settings-ui-test COMMAND settings-ui-test)
+    set_tests_properties(settings-ui-test PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Kokoro speech synthesis lives in its own process; see
     # docs/adr/0002-kokoro-tts-in-separate-process.md. sherpa-onnx is the
@@ -481,6 +520,9 @@ elseif(APPLE)
         src/qt_ui_main.cpp
         src/speech_player_miniaudio.cpp
         src/speech_queue.cpp
+        src/ui/design_tokens.cpp
+        src/ui/overlay_theme.cpp
+        src/ui/settings_types.cpp
         src/macos/macos_hotkey.mm
         src/macos/macos_login_item.mm
         src/macos/macos_overlay.mm
@@ -558,6 +600,8 @@ elseif(APPLE)
     add_subdirectory(packaging/macos/virtual-mic)
 endif()
 
+enable_testing()
+
 if(TARGET sensevoice-ui)
     # English UI. Chinese is the source language, so only the English
     # catalogue is compiled; refresh it with the update_translations target.
@@ -569,12 +613,18 @@ if(TARGET sensevoice-ui)
             RESOURCE_PREFIX /i18n
             LUPDATE_OPTIONS -locations none -source-language zh_CN
         )
+        add_test(NAME translations-check
+            COMMAND ${CMAKE_COMMAND}
+                -DTS_FILE=${CMAKE_CURRENT_SOURCE_DIR}/resources/i18n/speakanything_en.ts
+                -DQM_FILE=${CMAKE_CURRENT_BINARY_DIR}/speakanything_en.qm
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_translations.cmake)
+        set_tests_properties(translations-check PROPERTIES
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     else()
         message(WARNING "Qt LinguistTools not found; the UI will only be available in Chinese")
     endif()
 endif()
 
-enable_testing()
 find_package(Threads REQUIRED)
 add_executable(stability-tracker-test
     tests/stability_tracker_test.cpp
@@ -690,6 +740,58 @@ if(TARGET Qt6::Core)
         target_compile_options(model-manager-test PRIVATE /utf-8 /W4 /permissive-)
     endif()
     add_test(NAME model-manager-test COMMAND model-manager-test)
+endif()
+
+# Release builds define NDEBUG, which turns assert() into a no-op. Test
+# executables must keep their assertions active in every configuration.
+foreach(test_target
+    windows-text-injector-test
+    stability-tracker-test
+    text-processor-test
+    audio-conditioner-test
+    compute-policy-test
+    fbank-test
+    hotword-boost-test
+    translator-test
+    model-manager-test
+)
+    if(TARGET ${test_target})
+        if(MSVC)
+            target_compile_options(${test_target} PRIVATE $<$<CONFIG:Release>:/UNDEBUG>)
+        else()
+            target_compile_options(${test_target} PRIVATE $<$<CONFIG:Release>:-UNDEBUG>)
+        endif()
+    endif()
+endforeach()
+
+if(TARGET Qt6::Core)
+    add_executable(settings-types-test
+        tests/settings_types_test.cpp
+        src/ui/settings_types.cpp
+        src/compute_policy.cpp
+        src/text_processor.cpp
+        src/translation_session.cpp
+        src/languages.cpp
+    )
+    target_include_directories(settings-types-test PRIVATE src)
+    target_link_libraries(settings-types-test PRIVATE Qt6::Core Qt6::Gui ggml)
+    if(MSVC)
+        target_compile_options(settings-types-test PRIVATE /utf-8 /W4 /permissive-)
+    endif()
+    add_test(NAME settings-types-test COMMAND settings-types-test)
+endif()
+
+if(TARGET Qt6::Core)
+    add_executable(design-tokens-test
+        tests/design_tokens_test.cpp
+        src/ui/design_tokens.cpp
+    )
+    target_include_directories(design-tokens-test PRIVATE src)
+    target_link_libraries(design-tokens-test PRIVATE Qt6::Core Qt6::Gui)
+    if(MSVC)
+        target_compile_options(design-tokens-test PRIVATE /utf-8 /W4 /permissive-)
+    endif()
+    add_test(NAME design-tokens-test COMMAND design-tokens-test)
 endif()
 
 if(SENSEVOICE_CT2_SHARED)

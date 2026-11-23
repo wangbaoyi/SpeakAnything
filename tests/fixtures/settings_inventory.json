@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "pages": [
+    {
+      "id": "page_input",
+      "controls": [
+        {"id": "input_compute", "type": "combobox", "label": "识别设备", "default": "auto"},
+        {"id": "input_shortcut_preset", "type": "combobox", "label": "组合键", "default": "Ctrl+Win"},
+        {"id": "input_shortcut_edit", "type": "keysequence", "label": "录入", "default": null},
+        {"id": "input_trigger", "type": "combobox", "label": "触发方式", "default": "hold"},
+        {"id": "input_mute", "type": "checkbox", "label": "录音时静音系统播放", "default": false},
+        {"id": "input_startup", "type": "checkbox", "label": "开机自动启动", "default": false}
+      ]
+    },
+    {
+      "id": "page_output",
+      "controls": [
+        {"id": "output_mode_raw", "type": "button", "label": "原文", "default": false},
+        {"id": "output_mode_clean", "type": "button", "label": "精简", "default": true},
+        {"id": "output_destination", "type": "combobox", "label": "去向", "default": "insert"},
+        {"id": "output_popup_content", "type": "combobox", "label": "浮窗内容", "default": "both"},
+        {"id": "output_clipboard_content", "type": "combobox", "label": "剪贴板内容", "default": "original"},
+        {"id": "output_clipboard_ttl", "type": "spinbox", "label": "剪贴板保留", "default": 0},
+        {"id": "output_paste_delay", "type": "slider", "label": "粘贴延迟", "default": 200}
+      ]
+    },
+    {
+      "id": "page_appearance",
+      "controls": [
+        {"id": "appearance_theme_preset", "type": "combobox", "label": "主题", "default": "default"},
+        {"id": "appearance_color_background", "type": "button", "label": "背景", "default": null},
+        {"id": "appearance_color_text", "type": "button", "label": "文字", "default": null},
+        {"id": "appearance_color_accent", "type": "button", "label": "强调色", "default": null},
+        {"id": "appearance_font_family", "type": "combobox", "label": "字体", "default": null},
+        {"id": "appearance_font_size", "type": "spinbox", "label": "字号", "default": 10},
+        {"id": "appearance_linger", "type": "slider", "label": "识别完成后的停留时长", "default": 3},
+        {"id": "appearance_pinned", "type": "checkbox", "label": "常驻显示", "default": false}
+      ]
+    },
+    {
+      "id": "page_translation",
+      "controls": [
+        {"id": "translation_enabled", "type": "checkbox", "label": "开启翻译模式", "default": false},
+        {"id": "translation_source", "type": "combobox", "label": "我说的语言", "default": "zh"},
+        {"id": "translation_target", "type": "combobox", "label": "翻译成", "default": "en"},
+        {"id": "translation_device", "type": "combobox", "label": "计算设备", "default": "auto"},
+        {"id": "translation_separator", "type": "lineedit", "label": "分隔符", "default": " | "}
+      ]
+    },
+    {
+      "id": "page_speech",
+      "controls": [
+        {"id": "speech_enabled", "type": "checkbox", "label": "开启朗读", "default": false},
+        {"id": "speech_live", "type": "checkbox", "label": "边说边朗读", "default": false},
+        {"id": "speech_device", "type": "combobox", "label": "设备", "default": "default"},
+        {"id": "speech_monitor", "type": "checkbox", "label": "监听", "default": false},
+        {"id": "speech_voice_en", "type": "combobox", "label": "英文声音", "default": "auto"},
+        {"id": "speech_voice_zh", "type": "combobox", "label": "中文声音", "default": "auto"},
+        {"id": "speech_speed", "type": "slider", "label": "语速", "default": 100}
+      ]
+    },
+    {
+      "id": "page_hotwords",
+      "controls": [
+        {"id": "hotwords_table", "type": "table", "label": "热词表", "default": null},
+        {"id": "hotwords_add", "type": "button", "label": "添加热词", "default": null},
+        {"id": "hotwords_remove", "type": "button", "label": "删除所选", "default": null},
+        {"id": "hotwords_empty", "type": "label", "label": "空状态", "default": null}
+      ]
+    },
+    {
+      "id": "page_models",
+      "controls": [
+        {"id": "models_directory_label", "type": "label", "label": "当前模型目录", "default": null},
+        {"id": "models_directory_choose", "type": "button", "label": "选择目录", "default": null},
+        {"id": "models_directory_reset", "type": "button", "label": "恢复默认", "default": null},
+        {"id": "models_recognizer_combo", "type": "combobox", "label": "识别模型", "default": "auto"},
+        {"id": "models_recognizer_state", "type": "label", "label": "识别模型状态", "default": null},
+        {"id": "models_recognizer_status", "type": "label", "label": "识别模型说明", "default": null},
+        {"id": "models_recognizer_download", "type": "button", "label": "下载", "default": null},
+        {"id": "models_recognizer_browser", "type": "button", "label": "浏览器下载", "default": null},
+        {"id": "models_recognizer_import", "type": "button", "label": "导入", "default": null},
+        {"id": "models_recognizer_remove", "type": "button", "label": "删除", "default": null},
+        {"id": "models_recognizer_progress", "type": "progress", "label": "下载进度", "default": null},
+        {"id": "models_translator_combo", "type": "combobox", "label": "翻译模型", "default": "auto"},
+        {"id": "models_translator_state", "type": "label", "label": "翻译模型状态", "default": null},
+        {"id": "models_translator_status", "type": "label", "label": "翻译模型说明", "default": null},
+        {"id": "models_translator_download", "type": "button", "label": "下载", "default": null},
+        {"id": "models_translator_browser", "type": "button", "label": "浏览器下载", "default": null},
+        {"id": "models_translator_import", "type": "button", "label": "导入", "default": null},
+        {"id": "models_translator_remove", "type": "button", "label": "删除", "default": null},
+        {"id": "models_translator_progress", "type": "progress", "label": "下载进度", "default": null},
+        {"id": "models_voice_combo", "type": "combobox", "label": "朗读声音", "default": "auto"},
+        {"id": "models_voice_state", "type": "label", "label": "声音模型状态", "default": null},
+        {"id": "models_voice_status", "type": "label", "label": "声音模型说明", "default": null},
+        {"id": "models_voice_download", "type": "button", "label": "下载", "default": null},
+        {"id": "models_voice_browser", "type": "button", "label": "浏览器下载", "default": null},
+        {"id": "models_voice_import", "type": "button", "label": "导入", "default": null},
+        {"id": "models_voice_remove", "type": "button", "label": "删除", "default": null},
+        {"id": "models_voice_progress", "type": "progress", "label": "下载进度", "default": null}
+      ]
+    },
+    {
+      "id": "page_vad",
+      "controls": [
+        {"id": "vad_endpoint", "type": "slider", "label": "句尾静音", "default": 600},
+        {"id": "vad_threshold", "type": "slider", "label": "模型阈值", "default": 50},
+        {"id": "vad_minimum_db", "type": "slider", "label": "最低响度", "default": -60},
+        {"id": "vad_snr", "type": "slider", "label": "底噪余量", "default": 3}
+      ]
+    }
+  ]
+}

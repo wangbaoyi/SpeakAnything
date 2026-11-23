@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model_manager.h"
+#include "ui/settings_types.h"
 
 #include <QHash>
 #include <QString>
@@ -11,16 +12,7 @@ class QLabel;
 class QProgressBar;
 class QPushButton;
 
-// Which model to use for each job. "auto" picks the best installed one.
-// Recognizers are chosen per spoken language and voices per output language.
-struct ModelChoices {
-    QHash<QString, QString> recognizer; // language -> model id
-    QHash<QString, QString> voice;      // language -> model id
-    QString translator = QStringLiteral("auto");
-    // Extra places to look for models the user downloaded elsewhere.
-    QString custom_directory;              // an extra search root
-    QHash<QString, QString> custom_paths;  // model id -> file or folder
-};
+using sa::settings::ModelChoices;
 
 // Settings page: pick the recognizer, translator and voice for the current
 // languages, and download or remove models.
@@ -36,11 +28,14 @@ private:
     struct Row {
         ModelKind kind;
         QComboBox* combo = nullptr;
+        QLabel* state = nullptr;
         QLabel* status = nullptr;
         QPushButton* download = nullptr;
         QPushButton* browser = nullptr;
         QPushButton* import_button = nullptr;
         QPushButton* remove = nullptr;
+        QLabel* delete_hint = nullptr;
+        QWidget* actions = nullptr;
         QProgressBar* progress = nullptr;
     };
 

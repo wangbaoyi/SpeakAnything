@@ -11,6 +11,11 @@
 #include "model_catalog.h"
 #include "model_manager.h"
 #include "models_page.h"
+#include "ui/design_tokens.h"
+#include "ui/overlay_theme.h"
+#include "ui/settings_types.h"
+#include "ui/settings_test_hooks.h"
+#include "ui/ui_strings.h"
 #include "text_injector.h"
 #include "whisper_engine.h"
 
@@ -139,11 +144,8 @@ using DwmEnableBlurBehindWindowFn = HRESULT (WINAPI *)(HWND, const DwmBlurBehind
 
 namespace {
 
-// Translation context for every user-visible string. Chinese is the source
-// language; resources/i18n/speakanything_en.ts carries the English text.
-struct Ui {
-    Q_DECLARE_TR_FUNCTIONS(SpeakAnything)
-};
+using namespace sa::settings;
+using namespace sa::ui;
 
 constexpr int bubble_minimum_width = 132;
 constexpr int bubble_maximum_size = 520;
@@ -155,247 +157,7 @@ constexpr int bubble_vertical_padding = 24;
 constexpr int window_margin = 6;
 constexpr int control_spacing = 8;
 
-enum class BubbleStyle {
-    Capsule,
-    Panel,
-    Ring,
-};
-
-QString bubbleStyleName(BubbleStyle style) {
-    switch (style) {
-    case BubbleStyle::Capsule:
-        return QStringLiteral("capsule");
-    case BubbleStyle::Panel:
-        return QStringLiteral("panel");
-    case BubbleStyle::Ring:
-        return QStringLiteral("ring");
-    }
-    return QStringLiteral("panel");
-}
-
-BubbleStyle bubbleStyleFromName(const QString& value) {
-    const QString normalized = value.trimmed().toLower();
-    if (normalized == QStringLiteral("capsule") || normalized == QStringLiteral("pill")) {
-        return BubbleStyle::Capsule;
-    }
-    if (normalized == QStringLiteral("ring") || normalized == QStringLiteral("circle")) {
-        return BubbleStyle::Ring;
-    }
-    return BubbleStyle::Panel;
-}
-
-QString to_qstring(const std::string& text) {
-    return QString::fromUtf8(text.data(), static_cast<qsizetype>(text.size()));
-}
-
-std::string to_utf8_string(const QString& text) {
-    const QByteArray bytes = text.toUtf8();
-    return std::string(bytes.constData(), static_cast<std::size_t>(bytes.size()));
-}
-
-// Hold-to-talk only types on release, so a long sentence-end silence costs
-// nothing; a short one splits natural pauses into separately punctuated and
-// separately translated fragments. Windows keeps its tuned 700 ms.
-#ifdef __APPLE__
-constexpr int default_endpoint_ms = 1200;
-#else
-constexpr int default_endpoint_ms = 700;
-#endif
-
-struct VadSettings {
-    int endpoint_ms = default_endpoint_ms;
-    int threshold_percent = 55;
-    int minimum_db = -60;
-    int snr_db = 3;
-};
-
-constexpr auto default_translation_separator = " / ";
-
-struct TranslationSettings {
-    bool enabled = false;
-    TranslationDirection direction = TranslationDirection::ZhToEn;
-    // Translation has its own device, independent of recognition.
-    ComputePolicy device = ComputePolicy::Auto;
-    QString separator = QString::fromLatin1(default_translation_separator);
-};
-
-// 朗读: speak each session's 译文 into the 朗读设备 (see GLOSSARY.md).
-// Voices are Kokoro v1.1 speaker ids.
-constexpr int default_speech_voice_en = 0; // af_maple
-constexpr int default_speech_voice_zh = 3; // zf_001
-
-struct SpeechSettings {
-    bool enabled = false;
-    QString device_id;
-    bool monitor = false;
-    int voice_zh = default_speech_voice_zh;
-    int voice_en = default_speech_voice_en;
-    int speed_percent = 100;
-    // Speak each sentence as soon as it is translated, before the key is released.
-    bool live = false;
-};
-
-// Speaker order inside voices.bin of kokoro-multi-lang-v1_1: three English
-// voices, then the Chinese female voices, then the Chinese male voices.
-QList<QPair<int, QString>> kokoroChineseVoices() {
-    static constexpr int female[] = {1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 21, 22, 23, 24, 26, 27, 28, 32,
-                                     36, 38, 39, 40, 42, 43, 44, 46, 47, 48, 49, 51, 59, 60, 67, 70, 71,
-                                     72, 73, 74, 75, 76, 77, 78, 79, 83, 84, 85, 86, 87, 88, 90, 92, 93,
-                                     94, 99};
-    static constexpr int male[] = {9, 10, 11, 12, 13, 14, 15, 16, 20, 25, 29, 30, 31, 33, 34, 35, 37, 41,
-                                   45, 50, 52, 53, 54, 55, 56, 57, 58, 61, 62, 63, 64, 65, 66, 68, 69,
-                                   80, 81, 82, 89, 91, 95, 96, 97, 98, 100};
-    QList<QPair<int, QString>> voices;
-    int id = 3;
-    for (const int number : female) {
-        voices.append({id++, Ui::tr("女声 %1").arg(number, 3, 10, QLatin1Char('0'))});
-    }
-    for (const int number : male) {
-        voices.append({id++, Ui::tr("男声 %1").arg(number, 3, 10, QLatin1Char('0'))});
-    }
-    return voices;
-}
-
-// The separator sits between the original and the translation on one line;
-// line breaks could send a chat message, so they are never allowed.
-QString sanitizedSeparator(QString separator) {
-    separator.remove(QLatin1Char('\r'));
-    separator.remove(QLatin1Char('\n'));
-    if (separator.trimmed().isEmpty()) return QString::fromLatin1(default_translation_separator);
-    return separator;
-}
-
-enum class ThemePreset { Default, Light, Dark, HighContrast, Custom };
-
-struct ThemeColors {
-    QColor background;
-    QColor text;
-    QColor accent;
-};
-
-struct AppearanceSettings {
-    ThemePreset preset = ThemePreset::Default;
-    ThemeColors custom{QColor(32, 37, 44), QColor(245, 246, 247), QColor(69, 184, 158)};
-    QString custom_font_family;
-    int custom_font_size = 10;
-    int linger_ms = 500;
-    bool pinned = false;
-};
-
-constexpr int linger_maximum_ms = 10'000;
-constexpr int linger_step_ms = 500;
-
-QString themePresetName(ThemePreset preset) {
-    switch (preset) {
-    case ThemePreset::Default: return QStringLiteral("default");
-    case ThemePreset::Light: return QStringLiteral("light");
-    case ThemePreset::Dark: return QStringLiteral("dark");
-    case ThemePreset::HighContrast: return QStringLiteral("high-contrast");
-    case ThemePreset::Custom: return QStringLiteral("custom");
-    }
-    return QStringLiteral("default");
-}
-
-ThemePreset themePresetFromName(const QString& name) {
-    for (ThemePreset preset : {ThemePreset::Light, ThemePreset::Dark,
-                               ThemePreset::HighContrast, ThemePreset::Custom}) {
-        if (name == themePresetName(preset)) return preset;
-    }
-    return ThemePreset::Default;
-}
-
-// The colours each bubble style has always drawn; the Default theme keeps them.
-ThemeColors styleDefaultColors(BubbleStyle style) {
-    switch (style) {
-    case BubbleStyle::Capsule:
-        return {QColor(27, 45, 51), QColor(235, 250, 246), QColor(99, 217, 181)};
-    case BubbleStyle::Ring:
-        return {QColor(78, 80, 86), QColor(242, 242, 247), QColor(69, 184, 158)};
-    case BubbleStyle::Panel:
-        return {QColor(251, 252, 253), QColor(31, 37, 43), QColor(69, 184, 158)};
-    }
-    return {QColor(251, 252, 253), QColor(31, 37, 43), QColor(69, 184, 158)};
-}
-
-// nullopt means "Default": every style keeps its own built-in palette.
-std::optional<ThemeColors> themeColors(const AppearanceSettings& appearance) {
-    switch (appearance.preset) {
-    case ThemePreset::Default: return std::nullopt;
-    case ThemePreset::Light: return ThemeColors{QColor(251, 252, 253), QColor(31, 37, 43), QColor(47, 158, 133)};
-    case ThemePreset::Dark: return ThemeColors{QColor(30, 35, 42), QColor(238, 241, 244), QColor(69, 184, 158)};
-    case ThemePreset::HighContrast: return ThemeColors{QColor(0, 0, 0), QColor(255, 255, 255), QColor(255, 212, 0)};
-    case ThemePreset::Custom: return appearance.custom;
-    }
-    return std::nullopt;
-}
-
-int themeFontSize(const AppearanceSettings& appearance) {
-    switch (appearance.preset) {
-    case ThemePreset::Dark: return 11;
-    case ThemePreset::HighContrast: return 12;
-    case ThemePreset::Custom: return appearance.custom_font_size;
-    default: return 10;
-    }
-}
-
-QFont themeFont(const AppearanceSettings& appearance) {
-    QFont font = QApplication::font();
-    if (appearance.preset == ThemePreset::Custom && !appearance.custom_font_family.isEmpty()) {
-        font.setFamily(appearance.custom_font_family);
-    }
-    font.setPointSize(themeFontSize(appearance));
-    font.setStyleStrategy(QFont::PreferAntialias);
-    return font;
-}
-
-QColor mixColor(const QColor& from, const QColor& to, double amount) {
-    const auto channel = [amount](int a, int b) {
-        return static_cast<int>(std::lround(a + (b - a) * amount));
-    };
-    return QColor(channel(from.red(), to.red()),
-                  channel(from.green(), to.green()),
-                  channel(from.blue(), to.blue()));
-}
-
-QColor readableOn(const QColor& background) {
-    return background.lightnessF() > 0.6 ? QColor(16, 20, 24) : QColor(250, 251, 252);
-}
-
-enum class TextMode {
-    Raw,
-    Clean,
-};
-
-enum class ResultDestination { Insert, CopyOnly };
-enum class ResultContent { Original, Translation, Both };
-enum class HotkeyTrigger { Hold, Toggle, Realtime };
-
 constexpr int toggle_session_limit_ms = 5 * 60 * 1000;
-
-constexpr int default_paste_delay_ms = 150;
-constexpr int maximum_paste_delay_ms = 2000;
-
-QString resultContentName(ResultContent content) {
-    switch (content) {
-    case ResultContent::Original: return QStringLiteral("original");
-    case ResultContent::Translation: return QStringLiteral("translation");
-    case ResultContent::Both: return QStringLiteral("both");
-    }
-    return QStringLiteral("original");
-}
-
-ResultContent resultContentFromName(const QString& name) {
-    if (name == resultContentName(ResultContent::Translation)) return ResultContent::Translation;
-    if (name == resultContentName(ResultContent::Both)) return ResultContent::Both;
-    return ResultContent::Original;
-}
-
-#ifdef __APPLE__
-constexpr auto default_hotkey = "Meta+Alt+Space";
-#else
-constexpr auto default_hotkey = "Ctrl+Alt+Space";
-#endif
-constexpr auto control_windows_hotkey = "Ctrl+Win";
 
 #ifdef _WIN32
 constexpr auto windows_startup_run_key =
@@ -462,43 +224,6 @@ bool setPlatformStartupEnabled(bool enabled) {
 #else
     return !enabled;
 #endif
-}
-
-QString canonicalShortcut(const QString& value) {
-    QString compact = value;
-    compact.remove(QLatin1Char(' '));
-    if (compact.compare(QString::fromLatin1(control_windows_hotkey), Qt::CaseInsensitive) == 0) {
-        return QString::fromLatin1(control_windows_hotkey);
-    }
-
-    const QKeySequence sequence = QKeySequence::fromString(value, QKeySequence::PortableText);
-    if (sequence.isEmpty() || sequence.count() != 1 || sequence[0].key() == Qt::Key_unknown) {
-        return {};
-    }
-    return sequence.toString(QKeySequence::PortableText);
-}
-
-bool hasUsableShortcutKey(const QString& shortcut) {
-#ifdef _WIN32
-    if (shortcut == QString::fromLatin1(control_windows_hotkey)) return true;
-#else
-    if (shortcut == QString::fromLatin1(control_windows_hotkey)) return false;
-#endif
-
-    const QKeySequence sequence = QKeySequence::fromString(shortcut, QKeySequence::PortableText);
-    if (sequence.isEmpty() || sequence.count() != 1) return false;
-    const Qt::Key key = sequence[0].key();
-    return key != Qt::Key_unknown && key != Qt::Key_Control && key != Qt::Key_Shift &&
-        key != Qt::Key_Alt && key != Qt::Key_Meta;
-}
-
-QString shortcutDisplayName(const QString& shortcut) {
-    if (shortcut == QString::fromLatin1(control_windows_hotkey)) {
-        return QStringLiteral("Ctrl + Win");
-    }
-    const QKeySequence sequence = QKeySequence::fromString(shortcut, QKeySequence::PortableText);
-    const QString native_text = sequence.toString(QKeySequence::NativeText);
-    return native_text.isEmpty() ? shortcut : native_text;
 }
 
 // Models, dictionaries and hotwords. Inside a macOS bundle they ship in
@@ -1037,6 +762,7 @@ public:
         cancel_button_ = new QToolButton;
         cancel_button_->setIcon(QWidget::style()->standardIcon(QStyle::SP_DialogCancelButton));
         cancel_button_->setToolTip(Ui::tr("取消"));
+        cancel_button_->setAccessibleName(Ui::tr("取消"));
         vad_dot_ = new VadStatusDot;
         waveform_ = new LevelWaveform;
         elapsed_label_ = new QLabel(QStringLiteral("00:00"));
@@ -1052,9 +778,11 @@ public:
         primary_button_ = new QToolButton;
         primary_button_->setObjectName(QStringLiteral("primary"));
         primary_button_->setToolTip(Ui::tr("开始"));
+        primary_button_->setAccessibleName(Ui::tr("开始"));
         translate_button_ = new QToolButton;
         translate_button_->setObjectName(QStringLiteral("translate"));
         translate_button_->setText(Ui::tr("译"));
+        translate_button_->setAccessibleName(Ui::tr("翻译模式"));
         translate_button_->setCheckable(true);
         direction_button_ = new QToolButton;
         direction_button_->setObjectName(QStringLiteral("direction"));
@@ -1063,6 +791,7 @@ public:
         close_button_->setObjectName(QStringLiteral("close"));
         close_button_->setText(QStringLiteral("×"));
         close_button_->setToolTip(Ui::tr("关闭浮窗"));
+        close_button_->setAccessibleName(Ui::tr("关闭浮窗"));
         close_button_->setVisible(false);
 
         layout_->addWidget(vad_dot_);
@@ -1187,6 +916,7 @@ public:
         primary_button_->setIcon(QWidget::style()->standardIcon(
             listening ? QStyle::SP_DialogApplyButton : QStyle::SP_MediaPlay));
         primary_button_->setToolTip(listening ? Ui::tr("完成") : Ui::tr("开始"));
+        primary_button_->setAccessibleName(primary_button_->toolTip());
         close_button_->setEnabled(!listening);
         elapsed_label_->setText(listening ? QStringLiteral("00:00") : Ui::tr("就绪"));
     }
@@ -1354,6 +1084,7 @@ private:
             text = spinner[static_cast<std::size_t>(spinner_frame_)] + QLatin1Char(' ') + text;
         }
         direction_button_->setText(text);
+        direction_button_->setAccessibleName(text);
     }
 
     QHBoxLayout* layout_ = nullptr;
@@ -1606,6 +1337,164 @@ private:
     int horizontal_padding_ = 32;
 };
 
+QString settingsStyleSheet() {
+    const auto c = [](ColorRole role) { return color(role).name(); };
+    QString style;
+    style += QStringLiteral("QDialog { background: %1; }").arg(c(ColorRole::Background));
+    style += QStringLiteral("QLabel { color: %1; }").arg(c(ColorRole::TextPrimary));
+    style += QStringLiteral(
+        "QListWidget#settingsSidebar { background: %1; border: 1px solid %2; "
+        "border-radius: 10px; padding: 8px; outline: 0; }")
+                 .arg(c(ColorRole::Sidebar), c(ColorRole::Border));
+    style += QStringLiteral(
+        "QListWidget#settingsSidebar:focus { border: 2px solid %1; }")
+                 .arg(c(ColorRole::Focus));
+    style += QStringLiteral(
+        "QListWidget#settingsSidebar::item { color: %1; min-height: 44px; padding: 11px 14px; "
+        "border-radius: 7px; margin: 2px 0; }")
+                 .arg(c(ColorRole::TextSecondary));
+    style += QStringLiteral("QListWidget#settingsSidebar::item:disabled { color: %1; }")
+                 .arg(c(ColorRole::TextMuted));
+    style += QStringLiteral("QListWidget#settingsSidebar::item:hover { background: %1; }")
+                 .arg(c(ColorRole::Background));
+    style += QStringLiteral(
+        "QListWidget#settingsSidebar::item:selected { background: %1; color: %2; "
+        "font-weight: 600; border: 1px solid %3; border-left: 3px solid %4; "
+        "padding-left: 12px; }")
+                 .arg(c(ColorRole::Surface), c(ColorRole::TextPrimary), c(ColorRole::Border),
+                      c(ColorRole::Accent));
+    style += QStringLiteral("QStackedWidget#settingsStack { background: transparent; border: none; }");
+    style += QStringLiteral(
+        "QScrollArea, QScrollArea > QWidget > QWidget#page { background: transparent; border: none; }");
+    style += QStringLiteral(
+        "QFrame#card { background: %1; border: 1px solid %2; border-radius: 8px; }")
+                 .arg(c(ColorRole::Surface), c(ColorRole::Border));
+    style += QStringLiteral("QFrame#card QLabel { background: transparent; }");
+    style += QStringLiteral("QLabel#cardTitle { color: %1; font-weight: 600; }")
+                 .arg(c(ColorRole::TextPrimary));
+    style += QStringLiteral("QLabel#cardHint { color: %1; }").arg(c(ColorRole::TextMuted));
+    style += QStringLiteral("QLabel#rowLabel { color: %1; }").arg(c(ColorRole::TextSecondary));
+    style += QStringLiteral(
+        "QComboBox, QKeySequenceEdit, QDoubleSpinBox { min-height: 32px; padding: 0 9px; "
+        "border: 1px solid %1; border-radius: 5px; background: %2; color: %3; }")
+                 .arg(c(ColorRole::Border), c(ColorRole::Surface), c(ColorRole::TextPrimary));
+    style += QStringLiteral(
+        "QComboBox:focus, QKeySequenceEdit:focus, QDoubleSpinBox:focus { "
+        "border: 1px solid %1; }")
+                 .arg(c(ColorRole::Focus));
+    style += QStringLiteral(
+        "QKeySequenceEdit:disabled, QKeySequenceEdit QLineEdit:disabled { "
+        "background: %1; color: %2; selection-background-color: %1; selection-color: %2; }")
+                 .arg(c(ColorRole::DisabledSurface), c(ColorRole::DisabledText));
+    style += QStringLiteral(
+        "QSlider::groove:horizontal { height: 4px; background: %1; border-radius: 2px; }")
+                 .arg(c(ColorRole::Border));
+    style += QStringLiteral("QSlider::sub-page:horizontal { background: %1; border-radius: 2px; }")
+                 .arg(c(ColorRole::SliderFill));
+    style += QStringLiteral(
+        "QSlider::handle:horizontal { width: 16px; margin: -6px 0; background: white; "
+        "border: 2px solid %1; border-radius: 8px; }")
+                 .arg(c(ColorRole::SliderFill));
+    style += QStringLiteral(
+        "QPushButton { min-width: 76px; min-height: 30px; border: 1px solid %1; "
+        "border-radius: 5px; background: %2; color: %3; }")
+                 .arg(c(ColorRole::Border), c(ColorRole::Surface), c(ColorRole::TextPrimary));
+    style += QStringLiteral("QPushButton:hover { background: %1; }").arg(c(ColorRole::Background));
+    style += QStringLiteral(
+        "QPushButton#primary, QPushButton[primary=\"true\"] { "
+        "border: none; background: %1; color: white; }")
+                 .arg(c(ColorRole::Accent));
+    style += QStringLiteral(
+        "QPushButton#primary:hover, QPushButton[primary=\"true\"]:hover { background: %1; }")
+                 .arg(c(ColorRole::AccentHover));
+    style += QStringLiteral(
+        "QPushButton#modeSegment, QPushButton[modeSegment=\"true\"] { "
+        "min-width: 88px; border-radius: 4px; background: %1; }")
+                 .arg(c(ColorRole::SurfaceSubtle));
+    style += QStringLiteral(
+        "QPushButton#modeSegment:checked, QPushButton[modeSegment=\"true\"]:checked { "
+        "border-color: %1; background: %2; color: %3; }")
+                 .arg(c(ColorRole::Accent), c(ColorRole::Selection), c(ColorRole::AccentHover));
+    style += QStringLiteral(
+        "QToolButton { width: 30px; height: 30px; border: 1px solid %1; border-radius: 5px; "
+        "background: %2; color: %3; }")
+                 .arg(c(ColorRole::Border), c(ColorRole::Surface), c(ColorRole::TextPrimary));
+    style += QStringLiteral("QToolButton:hover { background: %1; }").arg(c(ColorRole::Background));
+    style += QStringLiteral(
+        "QTableWidget { border: 1px solid %1; border-radius: 5px; background: %2; "
+        "gridline-color: %1; color: %3; }")
+                 .arg(c(ColorRole::Border), c(ColorRole::Surface), c(ColorRole::TextPrimary));
+    style += QStringLiteral("QTableWidget::item:selected { background: %1; color: %2; }")
+                 .arg(c(ColorRole::Selection), c(ColorRole::TextPrimary));
+    style += QStringLiteral(
+        "QHeaderView::section { padding: 7px; border: none; border-bottom: 1px solid %1; "
+        "background: %2; color: %3; }")
+                 .arg(c(ColorRole::Border), c(ColorRole::SurfaceSubtle), c(ColorRole::TextMuted));
+    return style;
+}
+
+SettingsEnvironment settingsEnvironmentFromSystem() {
+    return SettingsEnvironment{detect_gpu_capability(), list_audio_output_devices()};
+}
+
+// Page navigation skips the non-selectable group headings.
+class SettingsSidebar final : public QListWidget {
+public:
+    explicit SettingsSidebar(QWidget* parent = nullptr) : QListWidget(parent) {}
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override {
+        switch (event->key()) {
+        case Qt::Key_Up:
+        case Qt::Key_Down:
+            moveByPage(event->key() == Qt::Key_Down ? 1 : -1);
+            event->accept();
+            return;
+        case Qt::Key_Home:
+            moveToEdge(true);
+            event->accept();
+            return;
+        case Qt::Key_End:
+            moveToEdge(false);
+            event->accept();
+            return;
+        default:
+            QListWidget::keyPressEvent(event);
+        }
+    }
+
+private:
+    static bool isPageItem(const QListWidgetItem* item) {
+        return item != nullptr && item->data(Qt::UserRole).isValid();
+    }
+
+    void moveByPage(int step) {
+        int row = currentRow();
+        if (row < 0) {
+            moveToEdge(step > 0);
+            return;
+        }
+        for (row += step; row >= 0 && row < count(); row += step) {
+            if (!isPageItem(item(row))) continue;
+            setCurrentRow(row);
+            scrollToItem(item(row));
+            return;
+        }
+    }
+
+    void moveToEdge(bool first) {
+        const int start = first ? 0 : count() - 1;
+        const int end = first ? count() : -1;
+        const int step = first ? 1 : -1;
+        for (int row = start; row != end; row += step) {
+            if (!isPageItem(item(row))) continue;
+            setCurrentRow(row);
+            scrollToItem(item(row));
+            return;
+        }
+    }
+};
+
 class InputSettingsDialog final : public QDialog {
 public:
     InputSettingsDialog(const VadSettings& values,
@@ -1629,10 +1518,12 @@ public:
                         std::function<void(const AppearanceSettings&)> on_appearance_changed,
                         ModelManager* model_manager = nullptr,
                         ModelChoices model_choices = {},
+                        SettingsEnvironment environment = {},
                         QWidget* parent = nullptr)
         : QDialog(parent), appearance_(appearance), bubble_style_(bubble_style),
           compute_policy_(compute), translation_compute_policy_(translation_compute),
           model_manager_(model_manager), initial_model_choices_(std::move(model_choices)),
+          environment_(std::move(environment)),
           on_appearance_changed_(std::move(on_appearance_changed)) {
         setWindowTitle(Ui::tr("语音输入设置"));
         setWindowFlag(Qt::WindowContextHelpButtonHint, false);
@@ -1652,37 +1543,7 @@ public:
             "QLabel#cardTitle { font-weight: 600; }"
             "QLabel#cardHint { color: palette(placeholder-text); }"));
 #else
-        setStyleSheet(QStringLiteral(
-            "QDialog { background: #F7F8FA; }"
-            "QLabel { color: #202329; }"
-            "QListWidget#settingsSidebar { background: #EEF0F3; border: 1px solid #E3E6EB; border-radius: 10px; padding: 8px; outline: 0; }"
-            "QListWidget#settingsSidebar::item { color: #4A505A; padding: 11px 14px; border-radius: 7px; margin: 2px 0; }"
-            "QListWidget#settingsSidebar::item:hover { background: #F7F8FA; }"
-            "QListWidget#settingsSidebar::item:selected { background: #FFFFFF; color: #202329; font-weight: 600; border: 1px solid #E1E4E9; }"
-            "QStackedWidget#settingsStack { background: transparent; border: none; }"
-            "QScrollArea, QScrollArea > QWidget > QWidget#page { background: transparent; border: none; }"
-            "QFrame#card { background: #FFFFFF; border: 1px solid #E3E6EB; border-radius: 8px; }"
-            "QFrame#card QLabel { background: transparent; }"
-            "QLabel#cardTitle { color: #202329; font-weight: 600; }"
-            "QLabel#cardHint { color: #7A808A; }"
-            "QLabel#rowLabel { color: #4A505A; }"
-            "QComboBox, QKeySequenceEdit, QDoubleSpinBox { min-height: 32px; padding: 0 9px; border: 1px solid #D7DAE0; border-radius: 5px; background: #FFFFFF; color: #30343A; }"
-            "QComboBox:focus, QKeySequenceEdit:focus, QDoubleSpinBox:focus { border: 1px solid #356AE6; }"
-            "QKeySequenceEdit:disabled, QKeySequenceEdit QLineEdit:disabled { background: #F0F2F5; color: #858B95; selection-background-color: #F0F2F5; selection-color: #858B95; }"
-            "QSlider::groove:horizontal { height: 4px; background: #E2E5E9; border-radius: 2px; }"
-            "QSlider::sub-page:horizontal { background: #E6A52C; border-radius: 2px; }"
-            "QSlider::handle:horizontal { width: 16px; margin: -6px 0; background: white; border: 2px solid #E6A52C; border-radius: 8px; }"
-            "QPushButton { min-width: 76px; min-height: 30px; border: 1px solid #D7DAE0; border-radius: 5px; background: #FFFFFF; color: #30343A; }"
-            "QPushButton:hover { background: #F0F2F5; }"
-            "QPushButton#primary { border: none; background: #202329; color: white; }"
-            "QPushButton#primary:hover { background: #343840; }"
-            "QPushButton#modeSegment { min-width: 88px; border-radius: 4px; background: #F0F2F5; }"
-            "QPushButton#modeSegment:checked { border-color: #356AE6; background: #EAF0FF; color: #244FB7; }"
-            "QToolButton { width: 30px; height: 30px; border: 1px solid #D7DAE0; border-radius: 5px; background: #FFFFFF; color: #30343A; }"
-            "QToolButton:hover { background: #F0F2F5; }"
-            "QTableWidget { border: 1px solid #DADDE2; border-radius: 5px; background: #FFFFFF; gridline-color: #ECEEF1; color: #30343A; }"
-            "QTableWidget::item:selected { background: #EAF0FF; color: #202329; }"
-            "QHeaderView::section { padding: 7px; border: none; border-bottom: 1px solid #DADDE2; background: #F5F6F8; color: #676D77; }"));
+        setStyleSheet(settingsStyleSheet());
 #endif
 
         auto* root = new QVBoxLayout(this);
@@ -1698,36 +1559,89 @@ public:
 
         auto* body = new QHBoxLayout;
         body->setSpacing(16);
-        auto* sidebar = new QListWidget;
+        auto* sidebar = new SettingsSidebar;
         sidebar->setObjectName(QStringLiteral("settingsSidebar"));
-        sidebar->setFixedWidth(168);
-        sidebar->setFocusPolicy(Qt::NoFocus);
+        sidebar->setFixedWidth(184);
+        sidebar->setFocusPolicy(Qt::StrongFocus);
+        sidebar->setAccessibleName(Ui::tr("设置导航"));
         sidebar->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         auto* stack = new QStackedWidget;
         stack->setObjectName(QStringLiteral("settingsStack"));
-        const auto add_page = [sidebar, stack](const QString& title, QWidget* page) {
-            sidebar->addItem(title);
-            stack->addWidget(page);
-        };
-        add_page(Ui::tr("输入"),
-                 scrollable(createInputPage(shortcut, trigger, startup_enabled, mute_while_recording)));
-        add_page(Ui::tr("输出"),
-                 scrollable(createOutputPage(mode, destination, input_content, clipboard_content,
-                                             paste_delay_ms, clipboard_ttl_seconds)));
-        add_page(Ui::tr("外观"), scrollable(carded(createAppearancePage())));
-        add_page(Ui::tr("翻译"), scrollable(carded(createTranslationPage(translation))));
-        add_page(Ui::tr("朗读"), scrollable(createSpeechPage(speech)));
-        add_page(Ui::tr("热词"), createHotwordPage(hotwords));
+        sidebar_ = sidebar;
+        stack_ = stack;
+
+        QWidget* pages[8] = {};
+        pages[0] = scrollable(createInputPage(shortcut, trigger, startup_enabled, mute_while_recording));
+        pages[1] = scrollable(createOutputPage(mode, destination, input_content, clipboard_content,
+                                               paste_delay_ms, clipboard_ttl_seconds));
+        pages[2] = scrollable(createAppearancePage());
+        pages[3] = scrollable(createTranslationPage(translation));
+        pages[4] = scrollable(createSpeechPage(speech));
+        pages[5] = createHotwordPage(hotwords);
         if (model_manager_ != nullptr) {
             models_page_ = new ModelsPage(model_manager_, initial_model_choices_);
             models_page_->setLanguages(languageCode(translation_source_), languageCode(translation_target_));
-            add_page(Ui::tr("模型"), scrollable(models_page_));
+            pages[6] = scrollable(models_page_);
+        } else {
+            pages[6] = new QWidget;
         }
-        add_page(QStringLiteral("VAD"), scrollable(carded(createVadPage(values))));
-        connect(sidebar, &QListWidget::currentRowChanged, stack, &QStackedWidget::setCurrentIndex);
-        sidebar->setCurrentRow(0);
+        pages[7] = scrollable(createVadPage(values));
+        for (QWidget* page : pages) stack->addWidget(page);
+        const std::array<const char*, 8> page_names = {
+            "page_input", "page_output", "page_appearance", "page_translation",
+            "page_speech", "page_hotwords", "page_models", "page_vad"};
+        for (int index = 0; index < 8; ++index) {
+            if (pages[index] != nullptr) {
+                pages[index]->setObjectName(QString::fromLatin1(page_names[index]));
+            }
+        }
+
+        const auto add_group = [sidebar](const QString& title) {
+            auto* item = new QListWidgetItem(title, sidebar);
+            item->setFlags(Qt::NoItemFlags);
+            QFont group_font = item->font();
+            group_font.setWeight(QFont::DemiBold);
+            item->setFont(group_font);
+            item->setForeground(color(ColorRole::TextMuted));
+        };
+        const auto add_page_item = [sidebar](const QString& title, int page) {
+            auto* item = new QListWidgetItem(title, sidebar);
+            item->setData(Qt::UserRole, page);
+        };
+        add_group(Ui::tr("语音输入"));
+        add_page_item(Ui::tr("输入"), 0);
+        add_page_item(Ui::tr("输出"), 1);
+        add_page_item(QStringLiteral("VAD"), 7);
+        add_group(Ui::tr("语音能力"));
+        add_page_item(Ui::tr("翻译"), 3);
+        add_page_item(Ui::tr("朗读"), 4);
+        add_group(Ui::tr("资源"));
+        add_page_item(Ui::tr("热词"), 5);
+        add_page_item(Ui::tr("模型"), 6);
+        add_group(Ui::tr("个性化"));
+        add_page_item(Ui::tr("外观"), 2);
+
+        connect(sidebar, &QListWidget::currentRowChanged, this, [this](int row) {
+            if (sidebar_ == nullptr || stack_ == nullptr || row < 0) return;
+            const QListWidgetItem* item = sidebar_->item(row);
+            if (item == nullptr || !item->data(Qt::UserRole).isValid()) return;
+            stack_->setCurrentIndex(item->data(Qt::UserRole).toInt());
+            if (page_title_ != nullptr) page_title_->setText(item->text());
+        });
+        sidebar->setCurrentRow(1);
+
+        page_title_ = new QLabel(Ui::tr("输入"));
+        page_title_->setObjectName(QStringLiteral("pageTitle"));
+        QFont title_font = page_title_->font();
+        title_font.setPixelSize(page_title_size);
+        title_font.setWeight(QFont::DemiBold);
+        page_title_->setFont(title_font);
+        auto* content = new QVBoxLayout;
+        content->setSpacing(12);
+        content->addWidget(page_title_);
+        content->addWidget(stack, 1);
         body->addWidget(sidebar);
-        body->addWidget(stack, 1);
+        body->addLayout(content, 1);
         root->addLayout(body, 1);
         for (QComboBox* combo : {content_, clipboard_content_}) {
             connect(combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
@@ -1787,6 +1701,40 @@ public:
             }
             accept();
         });
+    }
+
+protected:
+    void showEvent(QShowEvent* event) override {
+        QDialog::showEvent(event);
+        if (initial_focus_done_ || stack_ == nullptr || stack_->currentWidget() == nullptr) return;
+        initial_focus_done_ = true;
+        const auto widgets = stack_->currentWidget()->findChildren<QWidget*>();
+        for (QWidget* widget : widgets) {
+            if (!widget->isVisibleTo(stack_->currentWidget()) || !widget->isEnabled()) continue;
+            if ((widget->focusPolicy() & Qt::TabFocus) == 0) continue;
+            widget->setFocus(Qt::OtherFocusReason);
+            return;
+        }
+    }
+
+public:
+    [[nodiscard]] int pageCount() const { return stack_ == nullptr ? 0 : stack_->count(); }
+    [[nodiscard]] int currentPage() const {
+        return stack_ == nullptr ? 0 : stack_->currentIndex();
+    }
+    void selectPage(int index) {
+        if (stack_ == nullptr) return;
+        const int bounded = std::clamp(index, 0, stack_->count() - 1);
+        stack_->setCurrentIndex(bounded);
+        if (sidebar_ == nullptr) return;
+        for (int row = 0; row < sidebar_->count(); ++row) {
+            const QListWidgetItem* item = sidebar_->item(row);
+            if (item == nullptr || !item->data(Qt::UserRole).isValid()) continue;
+            if (item->data(Qt::UserRole).toInt() != bounded) continue;
+            sidebar_->setCurrentRow(row);
+            if (page_title_ != nullptr) page_title_->setText(item->text());
+            return;
+        }
     }
 
     VadSettings values() const {
@@ -1912,35 +1860,45 @@ private:
 
     QWidget* createAppearancePage() {
         auto* page = new QWidget;
-        auto* layout = new QVBoxLayout(page);
-        layout->setContentsMargins(18, 18, 18, 16);
-        layout->setSpacing(10);
+        auto* layout = pageLayout(page);
 
-        const auto add_heading = [layout](const QString& text) {
-            auto* label = new QLabel(text);
-            QFont font = label->font();
-            font.setWeight(QFont::DemiBold);
-            label->setFont(font);
-            layout->addWidget(label);
-        };
+        auto* live_note = new QLabel(Ui::tr("外观修改即时生效，不需要点“应用”，点“取消”也不会撤回。"));
+        live_note->setObjectName(QStringLiteral("cardHint"));
+        live_note->setWordWrap(true);
+        layout->addWidget(live_note);
 
-        add_heading(Ui::tr("配色主题与字体"));
+        QVBoxLayout* theme_card = addCard(layout, Ui::tr("配色主题"),
+            Ui::tr("主题决定浮窗的配色；选择“自定义”后可单独调整颜色和字体。"));
         theme_preset_ = new QComboBox;
+        theme_preset_->setObjectName(QStringLiteral("appearance_theme_preset"));
         theme_preset_->addItem(Ui::tr("默认（各浮窗样式原有配色）"), static_cast<int>(ThemePreset::Default));
         theme_preset_->addItem(Ui::tr("亮色"), static_cast<int>(ThemePreset::Light));
         theme_preset_->addItem(Ui::tr("暗色"), static_cast<int>(ThemePreset::Dark));
         theme_preset_->addItem(Ui::tr("高对比度"), static_cast<int>(ThemePreset::HighContrast));
         theme_preset_->addItem(Ui::tr("自定义"), static_cast<int>(ThemePreset::Custom));
-        layout->addWidget(theme_preset_);
+        addRow(theme_card, Ui::tr("主题"), theme_preset_);
 
-        auto* colors_row = new QHBoxLayout;
-        colors_row->setSpacing(8);
-        const auto add_color_button = [this, colors_row](const QString& label_text, QColor ThemeColors::*member) {
-            colors_row->addWidget(new QLabel(label_text));
+        QVBoxLayout* color_card = addCard(layout, Ui::tr("颜色"),
+            Ui::tr("点色块选择颜色，十六进制值显示在旁边。"));
+        const auto add_color_row = [this](QVBoxLayout* card,
+                                          const QString& label_text,
+                                          const QString& object_name,
+                                          QColor ThemeColors::*member,
+                                          QLabel** hex_label) {
+            auto* field = new QWidget;
+            auto* field_layout = new QHBoxLayout(field);
+            field_layout->setContentsMargins(0, 0, 0, 0);
+            field_layout->setSpacing(8);
             auto* button = new QPushButton;
+            button->setObjectName(object_name);
             button->setFixedSize(56, 28);
-            colors_row->addWidget(button);
-            colors_row->addSpacing(8);
+            button->setCursor(Qt::PointingHandCursor);
+            field_layout->addWidget(button);
+            auto* hex = new QLabel;
+            hex->setObjectName(QStringLiteral("cardHint"));
+            hex->setMinimumWidth(64);
+            field_layout->addWidget(hex);
+            field_layout->addStretch();
             connect(button, &QPushButton::clicked, this, [this, member, label_text] {
                 const ThemeColors colors = effectiveColors();
                 const QColor chosen = QColorDialog::getColor(colors.*member, this, label_text);
@@ -1949,40 +1907,42 @@ private:
                 appearance_.custom.*member = chosen;
                 appearanceChanged();
             });
+            addRow(card, label_text, field);
+            *hex_label = hex;
             return button;
         };
-        background_button_ = add_color_button(Ui::tr("背景"), &ThemeColors::background);
-        text_button_ = add_color_button(Ui::tr("文字"), &ThemeColors::text);
-        accent_button_ = add_color_button(Ui::tr("强调色"), &ThemeColors::accent);
-        colors_row->addStretch();
-        layout->addLayout(colors_row);
+        background_button_ = add_color_row(color_card, Ui::tr("背景"),
+                                           QStringLiteral("appearance_color_background"),
+                                           &ThemeColors::background, &background_hex_);
+        text_button_ = add_color_row(color_card, Ui::tr("文字"),
+                                     QStringLiteral("appearance_color_text"),
+                                     &ThemeColors::text, &text_hex_);
+        accent_button_ = add_color_row(color_card, Ui::tr("强调色"),
+                                       QStringLiteral("appearance_color_accent"),
+                                       &ThemeColors::accent, &accent_hex_);
 
-        auto* font_row = new QHBoxLayout;
-        font_row->setSpacing(8);
+        QVBoxLayout* font_card = addCard(layout, Ui::tr("字体"));
         font_family_ = new QFontComboBox;
+        font_family_->setObjectName(QStringLiteral("appearance_font_family"));
+        addRow(font_card, Ui::tr("字体"), font_family_);
         font_size_ = new QSpinBox;
+        font_size_->setObjectName(QStringLiteral("appearance_font_size"));
         font_size_->setRange(8, 24);
         font_size_->setSuffix(QStringLiteral(" pt"));
-        font_size_->setMinimumHeight(32);
-        font_row->addWidget(new QLabel(Ui::tr("字体")));
-        font_row->addWidget(font_family_, 1);
-        font_row->addWidget(font_size_);
-        layout->addLayout(font_row);
+        addRow(font_card, Ui::tr("字号"), font_size_);
 
-        layout->addSpacing(6);
-        add_heading(Ui::tr("浮窗显示"));
-        linger_slider_ = addSlider(layout, Ui::tr("识别完成后的停留时长"), 0,
-                                   linger_maximum_ms / linger_step_ms, 1,
-                                   appearance_.linger_ms / linger_step_ms, ValueFormat::HalfSeconds);
-        pinned_checkbox_ = new QCheckBox(Ui::tr("常驻显示（按快捷键唤出后不自动隐藏，点浮窗上的 × 关闭）"));
+        QVBoxLayout* display_card = addCard(layout, Ui::tr("浮窗显示"));
+        linger_slider_ = addSliderRow(display_card, Ui::tr("识别完成后的停留时长"),
+                                      QStringLiteral("appearance_linger"), 0,
+                                      linger_maximum_ms / linger_step_ms, 1,
+                                      appearance_.linger_ms / linger_step_ms,
+                                      ValueFormat::HalfSeconds);
+        pinned_checkbox_ = new QCheckBox;
+        pinned_checkbox_->setObjectName(QStringLiteral("appearance_pinned"));
         pinned_checkbox_->setChecked(appearance_.pinned);
-        layout->addWidget(pinned_checkbox_);
+        addToggleRow(display_card, Ui::tr("常驻显示"),
+                     Ui::tr("按快捷键唤出后不自动隐藏，点浮窗上的 × 关闭。"), pinned_checkbox_);
         layout->addStretch();
-
-        auto* note = new QLabel(Ui::tr("外观修改即时生效，不需要点“应用”，点“取消”也不会撤回。"));
-        note->setWordWrap(true);
-        note->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
-        layout->addWidget(note);
 
         refreshAppearanceControls();
 
@@ -2037,17 +1997,18 @@ private:
         updating_appearance_ = true;
         theme_preset_->setCurrentIndex(theme_preset_->findData(static_cast<int>(appearance_.preset)));
         const ThemeColors colors = effectiveColors();
-        const std::array<std::pair<QPushButton*, QColor>, 3> swatches = {{
-            {background_button_, colors.background},
-            {text_button_, colors.text},
-            {accent_button_, colors.accent},
-        }};
-        for (const auto& [button, color] : swatches) {
+        const auto update_swatch = [](QPushButton* button, QLabel* hex, QColor color,
+                                      const QString& name) {
             button->setStyleSheet(QStringLiteral(
                 "QPushButton { min-width: 0; background: %1; border: 1px solid #C9CDD3; border-radius: 5px; }")
                                       .arg(color.name()));
             button->setToolTip(color.name().toUpper());
-        }
+            button->setAccessibleName(name + QStringLiteral(" ") + color.name().toUpper());
+            hex->setText(color.name().toUpper());
+        };
+        update_swatch(background_button_, background_hex_, colors.background, Ui::tr("背景颜色"));
+        update_swatch(text_button_, text_hex_, colors.text, Ui::tr("文字颜色"));
+        update_swatch(accent_button_, accent_hex_, colors.accent, Ui::tr("强调色"));
         const QFont font = themeFont(appearance_);
         font_family_->setCurrentFont(font);
         font_size_->setValue(font.pointSize());
@@ -2064,7 +2025,8 @@ private:
         return area;
     }
 
-    static QVBoxLayout* addCard(QVBoxLayout* page_layout, const QString& title, const QString& hint = {}) {
+    static QVBoxLayout* addCard(QVBoxLayout* page_layout, const QString& title,
+                                const QString& hint = {}, int stretch = 0) {
         auto* card = new QFrame;
         card->setObjectName(QStringLiteral("card"));
         auto* layout = new QVBoxLayout(card);
@@ -2072,41 +2034,43 @@ private:
         layout->setSpacing(10);
         auto* title_label = new QLabel(title);
         title_label->setObjectName(QStringLiteral("cardTitle"));
+        QFont title_font = title_label->font();
+        title_font.setPixelSize(card_title_size);
+        title_font.setWeight(QFont::DemiBold);
+        title_label->setFont(title_font);
         layout->addWidget(title_label);
         if (!hint.isEmpty()) {
             auto* hint_label = new QLabel(hint);
             hint_label->setObjectName(QStringLiteral("cardHint"));
             hint_label->setWordWrap(true);
+            QFont hint_font = hint_label->font();
+            hint_font.setPixelSize(hint_size);
+            hint_label->setFont(hint_font);
             layout->addWidget(hint_label);
         }
-        page_layout->addWidget(card);
+        page_layout->addWidget(card, stretch);
         return layout;
     }
 
     static void addRow(QVBoxLayout* card, const QString& label_text, QWidget* field) {
-        auto* row = new QHBoxLayout;
+        auto* container = new QWidget;
+        container->setObjectName(QStringLiteral("row"));
+        container->setMinimumHeight(row_min_height);
+        auto* row = new QHBoxLayout(container);
+        row->setContentsMargins(0, 0, 0, 0);
         row->setSpacing(12);
         auto* label = new QLabel(label_text);
         label->setObjectName(QStringLiteral("rowLabel"));
+        QFont label_font = label->font();
+        label_font.setPixelSize(body_size);
+        label->setFont(label_font);
         // One width per language keeps the fields in a card aligned; English
         // labels run longer than the Chinese ones 76 px was sized for.
         static const int label_width = Ui::tr("组合键") == QStringLiteral("组合键") ? 76 : 124;
         label->setFixedWidth(label_width);
         row->addWidget(label);
         row->addWidget(field, 1);
-        card->addLayout(row);
-    }
-
-    static QWidget* carded(QWidget* inner) {
-        auto* page = new QWidget;
-        auto* layout = pageLayout(page);
-        auto* card = new QFrame;
-        card->setObjectName(QStringLiteral("card"));
-        auto* card_layout = new QVBoxLayout(card);
-        card_layout->setContentsMargins(0, 0, 0, 0);
-        card_layout->addWidget(inner);
-        layout->addWidget(card);
-        return page;
+        card->addWidget(container);
     }
 
     static QVBoxLayout* pageLayout(QWidget* page) {
@@ -2139,8 +2103,9 @@ private:
             Ui::tr("自动在 GPU 可用时使用 GPU，否则使用 CPU。"
                    "更改设备后会重新加载识别模型。"));
         compute_ = makeComputeCombo(compute_policy_);
+        compute_->setObjectName(QStringLiteral("input_compute"));
         addRow(compute_card, Ui::tr("识别设备"), compute_);
-        const GpuCapability gpu = detect_gpu_capability();
+        const GpuCapability gpu = environment_.gpu;
         auto* detected = new QLabel;
         if (gpu.available) {
             const double gib = static_cast<double>(gpu.memory_total) / (1024.0 * 1024.0 * 1024.0);
@@ -2158,6 +2123,7 @@ private:
 
         QVBoxLayout* hotkey_card = addCard(layout, Ui::tr("快捷键"));
         shortcut_preset_ = new QComboBox;
+        shortcut_preset_->setObjectName(QStringLiteral("input_shortcut_preset"));
         shortcut_preset_->addItem(Ui::tr("%1（推荐）")
                                       .arg(shortcutDisplayName(QString::fromLatin1(default_hotkey))),
                                   QString::fromLatin1(default_hotkey));
@@ -2172,6 +2138,7 @@ private:
         addRow(hotkey_card, Ui::tr("组合键"), shortcut_preset_);
 
         shortcut_edit_ = new QKeySequenceEdit;
+        shortcut_edit_->setObjectName(QStringLiteral("input_shortcut_edit"));
         shortcut_edit_->setMaximumSequenceLength(1);
         shortcut_edit_->setToolTip(Ui::tr("点击后按下一个组合键"));
         shortcut_edit_row_ = new QWidget;
@@ -2191,6 +2158,7 @@ private:
         QVBoxLayout* trigger_card = addCard(layout, Ui::tr("触发方式"),
             Ui::tr("切换方式最长 5 分钟；实时方式会一直保持麦克风开启，直到再按一次快捷键或按 Esc。"));
         trigger_ = new QComboBox;
+        trigger_->setObjectName(QStringLiteral("input_trigger"));
         trigger_->addItem(Ui::tr("按住说话：按住开始，松开结束"), static_cast<int>(HotkeyTrigger::Hold));
         trigger_->addItem(Ui::tr("按一下切换：按一下开始，再按一下结束"), static_cast<int>(HotkeyTrigger::Toggle));
         trigger_->addItem(Ui::tr("实时模式：按一下开始，边说边输出，再按一下结束"),
@@ -2202,6 +2170,7 @@ private:
             Ui::tr("实时模式持续使用麦克风监听，不会自动静音扬声器。"
                    "按住和切换模式可按下面的选项决定是否静音。"));
         mute_checkbox_ = new QCheckBox(Ui::tr("录音时静音系统播放"));
+        mute_checkbox_->setObjectName(QStringLiteral("input_mute"));
         mute_checkbox_->setChecked(mute_while_recording);
         mute_checkbox_->setToolTip(Ui::tr(
             "外放时开启可以减少回声；戴耳机或实时模式下建议关闭。"));
@@ -2209,6 +2178,7 @@ private:
 
         QVBoxLayout* startup_card = addCard(layout, Ui::tr("启动"));
         startup_checkbox_ = new QCheckBox(Ui::tr("开机自动启动"));
+        startup_checkbox_->setObjectName(QStringLiteral("input_startup"));
         startup_checkbox_->setChecked(startup_enabled);
 #ifdef __APPLE__
         startup_checkbox_->setToolTip(Ui::tr(
@@ -2260,8 +2230,10 @@ private:
         mode_group_ = new QButtonGroup(this);
         raw_mode_button_ = new QPushButton(Ui::tr("原文"));
         clean_mode_button_ = new QPushButton(Ui::tr("精简"));
+        raw_mode_button_->setObjectName(QStringLiteral("output_mode_raw"));
+        clean_mode_button_->setObjectName(QStringLiteral("output_mode_clean"));
         for (QPushButton* button : {raw_mode_button_, clean_mode_button_}) {
-            button->setObjectName(QStringLiteral("modeSegment"));
+            button->setProperty("modeSegment", true);
             button->setCheckable(true);
             mode_row->addWidget(button);
         }
@@ -2273,6 +2245,7 @@ private:
 
         QVBoxLayout* result_card = addCard(layout, Ui::tr("识别结果"));
         destination_ = new QComboBox;
+        destination_->setObjectName(QStringLiteral("output_destination"));
         destination_->addItem(Ui::tr("输入到光标位置（同时复制到剪贴板）"),
                               static_cast<int>(ResultDestination::Insert));
         destination_->addItem(Ui::tr("只复制到剪贴板"),
@@ -2289,14 +2262,17 @@ private:
             return combo;
         };
         content_ = content_combo(input_content);
+        content_->setObjectName(QStringLiteral("output_popup_content"));
         content_->setToolTip(Ui::tr("识别完成后浮窗上显示的文字，只给自己看。"));
         addRow(result_card, Ui::tr("浮窗内容"), content_);
         clipboard_content_ = content_combo(clipboard_content);
+        clipboard_content_->setObjectName(QStringLiteral("output_clipboard_content"));
         clipboard_content_->setToolTip(Ui::tr(
             "放进剪贴板的文字；输入到光标位置的也是这一段。"
             "实时模式除外：剪贴板始终保存最近一句译文。"));
         addRow(result_card, Ui::tr("剪贴板内容"), clipboard_content_);
         clipboard_ttl_spin_ = new QSpinBox;
+        clipboard_ttl_spin_->setObjectName(QStringLiteral("output_clipboard_ttl"));
         clipboard_ttl_spin_->setRange(0, 600);
         clipboard_ttl_spin_->setSuffix(Ui::tr(" 秒"));
         clipboard_ttl_spin_->setSpecialValueText(Ui::tr("不自动清除"));
@@ -2316,6 +2292,7 @@ private:
         paste_delay_slider_ = addSlider(paste_layout, Ui::tr("粘贴延迟"),
                                         0, maximum_paste_delay_ms, 50, paste_delay_ms,
                                         ValueFormat::Milliseconds);
+        paste_delay_slider_->setObjectName(QStringLiteral("output_paste_delay"));
         const auto update_paste_delay = [this] {
             const bool insert =
                 destination_->currentData().toInt() == static_cast<int>(ResultDestination::Insert);
@@ -2330,23 +2307,16 @@ private:
 
     QWidget* createTranslationPage(const TranslationSettings& translation) {
         auto* page = new QWidget;
-        auto* layout = new QVBoxLayout(page);
-        layout->setContentsMargins(18, 18, 18, 16);
-        layout->setSpacing(12);
+        auto* layout = pageLayout(page);
 
-        const auto add_heading = [layout](const QString& text) {
-            auto* label = new QLabel(text);
-            QFont font = label->font();
-            font.setWeight(QFont::DemiBold);
-            label->setFont(font);
-            layout->addWidget(label);
-        };
-
-        translation_enabled_checkbox_ = new QCheckBox(Ui::tr("开启翻译模式"));
+        QVBoxLayout* mode_card = addCard(layout, Ui::tr("翻译"),
+            Ui::tr("开启后，原文和译文会一起写入光标位置。"));
+        translation_enabled_checkbox_ = new QCheckBox;
+        translation_enabled_checkbox_->setObjectName(QStringLiteral("translation_enabled"));
         translation_enabled_checkbox_->setChecked(translation.enabled);
         translation_enabled_checkbox_->setToolTip(Ui::tr(
             "开启后，原文和译文会一起写入光标位置。"));
-        layout->addWidget(translation_enabled_checkbox_);
+        addToggleRow(mode_card, Ui::tr("开启翻译模式"), QString(), translation_enabled_checkbox_);
 
         // Every language Qwen and Whisper handle; SenseVoice covers the first five.
         const auto make_language_combo = [](const std::string& selected) {
@@ -2362,22 +2332,15 @@ private:
             combo->setCurrentIndex(std::max(0, combo->findData(QString::fromStdString(selected))));
             return combo;
         };
-        add_heading(Ui::tr("我说的语言"));
-        translation_source_ = make_language_combo(translation.direction.source);
-        layout->addWidget(translation_source_);
-        add_heading(Ui::tr("翻译成"));
-        translation_target_ = make_language_combo(translation.direction.target);
-        layout->addWidget(translation_target_);
 
-        add_heading(Ui::tr("翻译设备"));
-        translation_device_ = makeComputeCombo(translation.device);
-        layout->addWidget(translation_device_);
-        auto* device_hint = new QLabel(Ui::tr(
-            "中英互译在 GPU 上使用 Opus-MT CUDA，其他语言使用 Qwen；"
-            "翻译设备与识别设备分开，更改后只重新加载翻译模型。"));
-        device_hint->setWordWrap(true);
-        device_hint->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
-        layout->addWidget(device_hint);
+        QVBoxLayout* language_card = addCard(layout, Ui::tr("语言"),
+            Ui::tr("选择我说的语言和翻译目标；模型页会跟随这里的选择。"));
+        translation_source_ = make_language_combo(translation.direction.source);
+        translation_source_->setObjectName(QStringLiteral("translation_source"));
+        addRow(language_card, Ui::tr("我说的语言"), translation_source_);
+        translation_target_ = make_language_combo(translation.direction.target);
+        translation_target_->setObjectName(QStringLiteral("translation_target"));
+        addRow(language_card, Ui::tr("翻译成"), translation_target_);
 
         const auto languages_changed = [this] {
             if (models_page_ != nullptr) {
@@ -2387,20 +2350,29 @@ private:
         connect(translation_source_, qOverload<int>(&QComboBox::currentIndexChanged), this, languages_changed);
         connect(translation_target_, qOverload<int>(&QComboBox::currentIndexChanged), this, languages_changed);
 
-        add_heading(Ui::tr("原文与译文之间的分隔符"));
+        QVBoxLayout* device_card = addCard(layout, Ui::tr("翻译设备"),
+            Ui::tr("中英互译在 GPU 上使用 Opus-MT CUDA，其他语言使用 Qwen；"
+                   "翻译设备与识别设备分开，更改后只重新加载翻译模型。"));
+        translation_device_ = makeComputeCombo(translation.device);
+        translation_device_->setObjectName(QStringLiteral("translation_device"));
+        addRow(device_card, Ui::tr("计算设备"), translation_device_);
+
+        QVBoxLayout* separator_card = addCard(layout, Ui::tr("分隔符"),
+            Ui::tr("原文与译文之间的分隔符，最多 8 个字符。"));
         translation_separator_ = new QLineEdit(translation.separator);
+        translation_separator_->setObjectName(QStringLiteral("translation_separator"));
         translation_separator_->setMaxLength(8);
 #ifndef __APPLE__
         translation_separator_->setStyleSheet(QStringLiteral(
             "QLineEdit { min-height: 32px; padding: 0 9px; border: 1px solid #D7DAE0; border-radius: 5px; background: #FFFFFF; color: #30343A; }"
             "QLineEdit:focus { border: 1px solid #356AE6; }"));
 #endif
-        layout->addWidget(translation_separator_);
+        addRow(separator_card, Ui::tr("分隔符"), translation_separator_);
 
         auto* example = new QLabel;
+        example->setObjectName(QStringLiteral("cardHint"));
         example->setWordWrap(true);
-        example->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
-        layout->addWidget(example);
+        separator_card->addWidget(example);
         const auto update_example = [this, example] {
             const bool zh_to_en = languageCode(translation_source_) == QStringLiteral("zh");
             const QString separator = sanitizedSeparator(translation_separator_->text());
@@ -2418,9 +2390,9 @@ private:
 
         auto* note = new QLabel(Ui::tr(
             "翻译失败、超时或说的语言与方向不符时，只输入原文。"));
+        note->setObjectName(QStringLiteral("cardHint"));
         note->setWordWrap(true);
-        note->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
-        layout->addWidget(note);
+        separator_card->addWidget(note);
         layout->addStretch();
         return page;
     }
@@ -2441,9 +2413,11 @@ private:
         QVBoxLayout* switch_card = addCard(layout, Ui::tr("朗读译文"),
             Ui::tr("松开快捷键后，把这一段的译文念到朗读设备，通话对方就能听到。翻译失败时不朗读。"));
         speech_enabled_checkbox_ = new QCheckBox(Ui::tr("开启朗读"));
+        speech_enabled_checkbox_->setObjectName(QStringLiteral("speech_enabled"));
         speech_enabled_checkbox_->setChecked(speech.enabled);
         switch_card->addWidget(speech_enabled_checkbox_);
         speech_live_checkbox_ = new QCheckBox(Ui::tr("边说边朗读：每句翻译好就开始念，不等松开快捷键"));
+        speech_live_checkbox_->setObjectName(QStringLiteral("speech_live"));
         speech_live_checkbox_->setChecked(speech.live);
         speech_live_checkbox_->setToolTip(Ui::tr(
             "说话中间停顿时，前面的句子就会被翻译并念出来。按 Esc 可取消还没念出的部分。"));
@@ -2460,8 +2434,9 @@ private:
             Ui::tr("通常选虚拟声卡（如 CABLE Input），再在通话软件里把麦克风选成它对应的输入（如 CABLE Output）。"));
 #endif
         speech_device_ = new QComboBox;
+        speech_device_->setObjectName(QStringLiteral("speech_device"));
         speech_device_->addItem(Ui::tr("（未选择）"), QString{});
-        for (const AudioOutputDevice& device : list_audio_output_devices()) {
+        for (const AudioOutputDevice& device : environment_.audio_outputs) {
             speech_device_->addItem(QString::fromStdWString(device.name), QString::fromStdWString(device.id));
         }
         if (!speech.device_id.isEmpty() && speech_device_->findData(speech.device_id) < 0) {
@@ -2470,6 +2445,7 @@ private:
         speech_device_->setCurrentIndex(std::max(0, speech_device_->findData(speech.device_id)));
         addRow(device_card, Ui::tr("设备"), speech_device_);
         speech_monitor_checkbox_ = new QCheckBox(Ui::tr("监听：同时在自己的默认播放设备上播放"));
+        speech_monitor_checkbox_->setObjectName(QStringLiteral("speech_monitor"));
         speech_monitor_checkbox_->setChecked(speech.monitor);
         speech_monitor_checkbox_->setToolTip(Ui::tr("录音期间自动静音，避免被重新录进去。"));
         device_card->addWidget(speech_monitor_checkbox_);
@@ -2477,12 +2453,14 @@ private:
         QVBoxLayout* voice_card = addCard(layout, Ui::tr("声音"),
             Ui::tr("中文 → 英文时用英文声音，英文 → 中文时用中文声音。"));
         speech_voice_en_ = new QComboBox;
+        speech_voice_en_->setObjectName(QStringLiteral("speech_voice_en"));
         speech_voice_en_->addItem(Ui::tr("美式女声 Maple"), 0);
         speech_voice_en_->addItem(Ui::tr("美式女声 Sol"), 1);
         speech_voice_en_->addItem(Ui::tr("英式女声 Vale"), 2);
         speech_voice_en_->setCurrentIndex(std::max(0, speech_voice_en_->findData(speech.voice_en)));
         addRow(voice_card, Ui::tr("英文声音"), speech_voice_en_);
         speech_voice_zh_ = new QComboBox;
+        speech_voice_zh_->setObjectName(QStringLiteral("speech_voice_zh"));
         for (const auto& [id, name] : kokoroChineseVoices()) speech_voice_zh_->addItem(name, id);
         speech_voice_zh_->setCurrentIndex(std::max(0, speech_voice_zh_->findData(speech.voice_zh)));
         addRow(voice_card, Ui::tr("中文声音"), speech_voice_zh_);
@@ -2490,17 +2468,20 @@ private:
         voice_card->addLayout(speed_layout);
         speech_speed_slider_ = addSlider(speed_layout, Ui::tr("语速"), 50, 200, 10,
                                          speech.speed_percent, ValueFormat::Speed);
+        speech_speed_slider_->setObjectName(QStringLiteral("speech_speed"));
         layout->addStretch();
         return page;
     }
 
     QWidget* createHotwordPage(const std::vector<HotwordEntry>& entries) {
         auto* page = new QWidget;
-        auto* layout = new QVBoxLayout(page);
-        layout->setContentsMargins(14, 14, 14, 14);
-        layout->setSpacing(8);
+        auto* layout = pageLayout(page);
+
+        QVBoxLayout* table_card = addCard(layout, Ui::tr("热词表"),
+            Ui::tr("每行一个热词；别名用 | 分隔，增强范围 0.0 到 12.0。"), 1);
 
         hotword_table_ = new QTableWidget;
+        hotword_table_->setObjectName(QStringLiteral("hotwords_table"));
         hotword_table_->setColumnCount(6);
         hotword_table_->setHorizontalHeaderLabels({
             Ui::tr("启用"),
@@ -2520,32 +2501,48 @@ private:
         hotword_table_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
         hotword_table_->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
         for (const HotwordEntry& entry : entries) addHotwordRow(entry);
-        layout->addWidget(hotword_table_);
+        table_card->addWidget(hotword_table_, 1);
+
+        hotword_empty_hint_ = new QLabel(
+            Ui::tr("还没有热词。点下面的“添加热词”新增一条。"));
+        hotword_empty_hint_->setObjectName(QStringLiteral("hotwords_empty"));
+        hotword_empty_hint_->setWordWrap(true);
+        table_card->addWidget(hotword_empty_hint_);
 
         auto* controls = new QHBoxLayout;
-        controls->setSpacing(6);
-        auto* add_button = new QToolButton;
-        add_button->setText(QStringLiteral("+"));
+        controls->setSpacing(8);
+        auto* add_button = new QPushButton(Ui::tr("添加热词"));
+        add_button->setObjectName(QStringLiteral("hotwords_add"));
+        add_button->setProperty("primary", true);
         add_button->setToolTip(Ui::tr("添加热词"));
-        auto* remove_button = new QToolButton;
-        remove_button->setIcon(style()->standardIcon(QStyle::SP_DialogDiscardButton));
+        auto* remove_button = new QPushButton(Ui::tr("删除所选"));
+        remove_button->setObjectName(QStringLiteral("hotwords_remove"));
         remove_button->setToolTip(Ui::tr("删除所选热词"));
         controls->addWidget(add_button);
         controls->addWidget(remove_button);
         controls->addStretch();
-        layout->addLayout(controls);
+        table_card->addLayout(controls);
 
-        connect(add_button, &QToolButton::clicked, this, [this] {
+        updateHotwordEmptyState();
+
+        connect(add_button, &QPushButton::clicked, this, [this] {
             addHotwordRow(HotwordEntry{});
+            updateHotwordEmptyState();
             const int row = hotword_table_->rowCount() - 1;
             hotword_table_->setCurrentCell(row, 1);
             hotword_table_->editItem(hotword_table_->item(row, 1));
         });
-        connect(remove_button, &QToolButton::clicked, this, [this] {
+        connect(remove_button, &QPushButton::clicked, this, [this] {
             const int row = hotword_table_->currentRow();
             if (row >= 0) hotword_table_->removeRow(row);
+            updateHotwordEmptyState();
         });
         return page;
+    }
+
+    void updateHotwordEmptyState() {
+        if (hotword_empty_hint_ == nullptr || hotword_table_ == nullptr) return;
+        hotword_empty_hint_->setVisible(hotword_table_->rowCount() == 0);
     }
 
     void addHotwordRow(const HotwordEntry& entry) {
@@ -2585,17 +2582,33 @@ private:
 
     QWidget* createVadPage(const VadSettings& values) {
         auto* page = new QWidget;
-        auto* layout = new QVBoxLayout(page);
-        layout->setContentsMargins(18, 18, 18, 16);
-        layout->setSpacing(15);
-        endpoint_slider_ = addSlider(layout, Ui::tr("句尾静音"), 300, 2000, 100,
-                                     values.endpoint_ms, ValueFormat::Milliseconds);
-        threshold_slider_ = addSlider(layout, Ui::tr("模型阈值"), 5, 95, 5,
-                                      values.threshold_percent, ValueFormat::Threshold);
-        minimum_db_slider_ = addSlider(layout, Ui::tr("最低响度"), -80, -20, 1,
-                                       values.minimum_db, ValueFormat::Dbfs);
-        snr_slider_ = addSlider(layout, Ui::tr("底噪余量"), 0, 20, 1,
-                                values.snr_db, ValueFormat::Db);
+        auto* layout = pageLayout(page);
+
+        QVBoxLayout* sentence_card = addCard(layout, Ui::tr("句尾判定"),
+            Ui::tr("判断一句话什么时候结束；数值越大越保守，越不容易截断句子。"));
+        endpoint_slider_ = addSliderBlock(sentence_card, Ui::tr("句尾静音"),
+                                          QStringLiteral("vad_endpoint"), 300, 2000, 100,
+                                          values.endpoint_ms, ValueFormat::Milliseconds,
+                                          Ui::tr("范围 300–2000 ms。"),
+                                          Ui::tr("检测到多长的停顿后结束当前句子。"));
+        threshold_slider_ = addSliderBlock(sentence_card, Ui::tr("模型阈值"),
+                                           QStringLiteral("vad_threshold"), 5, 95, 5,
+                                           values.threshold_percent, ValueFormat::Threshold,
+                                           Ui::tr("范围 0.05–0.95。"),
+                                           Ui::tr("越低越容易判定语音结束。"));
+
+        QVBoxLayout* noise_card = addCard(layout, Ui::tr("噪声判定"),
+            Ui::tr("过滤持续背景声；数值越大越保守，越不容易被噪声触发。"));
+        minimum_db_slider_ = addSliderBlock(noise_card, Ui::tr("最低响度"),
+                                            QStringLiteral("vad_minimum_db"), -80, -20, 1,
+                                            values.minimum_db, ValueFormat::Dbfs,
+                                            Ui::tr("范围 -80 到 -20 dBFS。"),
+                                            Ui::tr("低于这个响度的声音按静音处理。"));
+        snr_slider_ = addSliderBlock(noise_card, Ui::tr("底噪余量"),
+                                     QStringLiteral("vad_snr"), 0, 20, 1,
+                                     values.snr_db, ValueFormat::Db,
+                                     Ui::tr("范围 0 到 20 dB。"),
+                                     Ui::tr("高于底噪多少分贝才算人声。"));
         layout->addStretch();
         return page;
     }
@@ -2609,6 +2622,24 @@ private:
             shortcut_edit_->setKeySequence(
                 QKeySequence::fromString(value, QKeySequence::PortableText));
         }
+    }
+
+    static QString sliderValueText(ValueFormat format, int current) {
+        switch (format) {
+        case ValueFormat::Milliseconds:
+            return QString::number(current) + QStringLiteral(" ms");
+        case ValueFormat::Threshold:
+            return QString::number(current / 100.0, 'f', 2);
+        case ValueFormat::Dbfs:
+            return QString::number(current) + QStringLiteral(" dBFS");
+        case ValueFormat::Db:
+            return QString::number(current) + QStringLiteral(" dB");
+        case ValueFormat::HalfSeconds:
+            return QString::number(current * linger_step_ms / 1000.0, 'f', 1) + Ui::tr(" 秒");
+        case ValueFormat::Speed:
+            return Ui::tr("%1 倍").arg(current / 100.0, 0, 'f', 1);
+        }
+        return QString{};
     }
 
     QSlider* addSlider(QVBoxLayout* root,
@@ -2639,32 +2670,151 @@ private:
         root->addWidget(container);
 
         const auto update_value = [value_label, format](int current) {
-            switch (format) {
-            case ValueFormat::Milliseconds:
-                value_label->setText(QString::number(current) + QStringLiteral(" ms"));
-                break;
-            case ValueFormat::Threshold:
-                value_label->setText(QString::number(current / 100.0, 'f', 2));
-                break;
-            case ValueFormat::Dbfs:
-                value_label->setText(QString::number(current) + QStringLiteral(" dBFS"));
-                break;
-            case ValueFormat::Db:
-                value_label->setText(QString::number(current) + QStringLiteral(" dB"));
-                break;
-            case ValueFormat::HalfSeconds:
-                value_label->setText(QString::number(current * linger_step_ms / 1000.0, 'f', 1) +
-                                     Ui::tr(" 秒"));
-                break;
-            case ValueFormat::Speed:
-                value_label->setText(Ui::tr("%1 倍").arg(current / 100.0, 0, 'f', 1));
-                break;
-            }
+            value_label->setText(sliderValueText(format, current));
         };
         connect(slider, &QSlider::valueChanged, this, update_value);
         slider->setValue(value);
         update_value(slider->value());
         return slider;
+    }
+
+    // A slider placed inside the standard 44 px row: label, track, value.
+    static QSlider* addSliderRow(QVBoxLayout* card,
+                                 const QString& label_text,
+                                 const QString& object_name,
+                                 int minimum,
+                                 int maximum,
+                                 int step,
+                                 int value,
+                                 ValueFormat format) {
+        auto* container = new QWidget;
+        container->setObjectName(QStringLiteral("row"));
+        container->setMinimumHeight(row_min_height);
+        auto* row = new QHBoxLayout(container);
+        row->setContentsMargins(0, 0, 0, 0);
+        row->setSpacing(12);
+        auto* label = new QLabel(label_text);
+        label->setObjectName(QStringLiteral("rowLabel"));
+        QFont label_font = label->font();
+        label_font.setPixelSize(body_size);
+        label->setFont(label_font);
+        static const int label_width = Ui::tr("组合键") == QStringLiteral("组合键") ? 76 : 124;
+        label->setFixedWidth(label_width);
+        row->addWidget(label);
+
+        auto* slider = new QSlider(Qt::Horizontal);
+        slider->setObjectName(object_name);
+        slider->setRange(minimum, maximum);
+        slider->setSingleStep(step);
+        slider->setPageStep(step);
+        row->addWidget(slider, 1);
+
+        auto* value_label = new QLabel;
+        value_label->setMinimumWidth(64);
+        value_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        value_label->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
+        row->addWidget(value_label);
+        card->addWidget(container);
+
+        const auto update_value = [value_label, format](int current) {
+            value_label->setText(sliderValueText(format, current));
+        };
+        QObject::connect(slider, &QSlider::valueChanged, value_label, update_value);
+        slider->setValue(value);
+        update_value(slider->value());
+        return slider;
+    }
+
+    // A VAD slider with its value, range and a one-line explanation.
+    static QSlider* addSliderBlock(QVBoxLayout* card,
+                                   const QString& label_text,
+                                   const QString& object_name,
+                                   int minimum,
+                                   int maximum,
+                                   int step,
+                                   int value,
+                                   ValueFormat format,
+                                   const QString& range_meaning,
+                                   const QString& description) {
+        auto* container = new QWidget;
+        container->setObjectName(QStringLiteral("sliderBlock"));
+        auto* block = new QVBoxLayout(container);
+        block->setContentsMargins(0, 6, 0, 6);
+        block->setSpacing(4);
+
+        auto* labels = new QHBoxLayout;
+        labels->setSpacing(12);
+        auto* label = new QLabel(label_text);
+        label->setObjectName(QStringLiteral("rowLabel"));
+        QFont label_font = label->font();
+        label_font.setPixelSize(body_size);
+        label->setFont(label_font);
+        labels->addWidget(label);
+        labels->addStretch();
+        auto* value_label = new QLabel;
+        value_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        value_label->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
+        labels->addWidget(value_label);
+        block->addLayout(labels);
+
+        auto* slider = new QSlider(Qt::Horizontal);
+        slider->setObjectName(object_name);
+        slider->setRange(minimum, maximum);
+        slider->setSingleStep(step);
+        slider->setPageStep(step);
+        block->addWidget(slider);
+
+        auto* hint = new QLabel(range_meaning + QStringLiteral(" ") + description);
+        hint->setObjectName(QStringLiteral("cardHint"));
+        hint->setWordWrap(true);
+        QFont hint_font = hint->font();
+        hint_font.setPixelSize(hint_size);
+        hint->setFont(hint_font);
+        block->addWidget(hint);
+        card->addWidget(container);
+
+        const auto update_value = [value_label, format](int current) {
+            value_label->setText(sliderValueText(format, current));
+        };
+        QObject::connect(slider, &QSlider::valueChanged, value_label, update_value);
+        slider->setValue(value);
+        update_value(slider->value());
+        return slider;
+    }
+
+    static void addToggleRow(QVBoxLayout* card,
+                             const QString& title,
+                             const QString& description,
+                             QCheckBox* check) {
+        auto* container = new QWidget;
+        container->setObjectName(QStringLiteral("row"));
+        container->setMinimumHeight(row_min_height);
+        auto* row = new QVBoxLayout(container);
+        row->setContentsMargins(0, 4, 0, 4);
+        row->setSpacing(2);
+        auto* top = new QHBoxLayout;
+        top->setSpacing(12);
+        auto* label = new QLabel(title);
+        label->setObjectName(QStringLiteral("rowLabel"));
+        QFont label_font = label->font();
+        label_font.setPixelSize(body_size);
+        label->setFont(label_font);
+        top->addWidget(label);
+        top->addStretch();
+        check->setText(Ui::tr("开启"));
+        check->setAccessibleName(title);
+        top->addWidget(check);
+        row->addLayout(top);
+        if (!description.isEmpty()) {
+            auto* hint = new QLabel(description);
+            hint->setObjectName(QStringLiteral("cardHint"));
+            hint->setWordWrap(true);
+            QFont hint_font = hint->font();
+            hint_font.setPixelSize(hint_size);
+            hint->setFont(hint_font);
+            row->addWidget(hint);
+        }
+        card->addWidget(container);
     }
 
     QSlider* endpoint_slider_ = nullptr;
@@ -2692,11 +2842,13 @@ private:
     QSlider* paste_delay_slider_ = nullptr;
     QSpinBox* clipboard_ttl_spin_ = nullptr;
     QTableWidget* hotword_table_ = nullptr;
+    QLabel* hotword_empty_hint_ = nullptr;
     QCheckBox* translation_enabled_checkbox_ = nullptr;
     QComboBox* translation_source_ = nullptr;
     QComboBox* translation_target_ = nullptr;
     ModelManager* model_manager_ = nullptr;
     ModelChoices initial_model_choices_;
+    SettingsEnvironment environment_;
     ModelsPage* models_page_ = nullptr;
 
     static QString languageCode(const QComboBox* combo) {
@@ -2722,12 +2874,19 @@ private:
     QSlider* speech_speed_slider_ = nullptr;
     AppearanceSettings appearance_;
     BubbleStyle bubble_style_;
+    QListWidget* sidebar_ = nullptr;
+    QStackedWidget* stack_ = nullptr;
+    QLabel* page_title_ = nullptr;
     std::function<void(const AppearanceSettings&)> on_appearance_changed_;
     bool updating_appearance_ = false;
+    bool initial_focus_done_ = false;
     QComboBox* theme_preset_ = nullptr;
     QPushButton* background_button_ = nullptr;
     QPushButton* text_button_ = nullptr;
     QPushButton* accent_button_ = nullptr;
+    QLabel* background_hex_ = nullptr;
+    QLabel* text_hex_ = nullptr;
+    QLabel* accent_hex_ = nullptr;
     QFontComboBox* font_family_ = nullptr;
     QSpinBox* font_size_ = nullptr;
     QSlider* linger_slider_ = nullptr;
@@ -3228,115 +3387,26 @@ private:
     }
 
     void loadSettings() {
-        loadModelChoices();
-        compute_policy_ = parse_compute_policy(settings_.value(
-            QString::fromLatin1(compute_policy_settings_key),
-            QStringLiteral("auto")).toString().toStdString()).value_or(ComputePolicy::Auto);
-        vad_settings_.endpoint_ms =
-            settings_.value(QStringLiteral("vad/endpoint_ms"), default_endpoint_ms).toInt();
-        vad_settings_.threshold_percent = settings_.value(QStringLiteral("vad/threshold_percent"), 55).toInt();
-        vad_settings_.minimum_db = settings_.value(QStringLiteral("vad/minimum_db"), -60).toInt();
-        vad_settings_.snr_db = settings_.value(QStringLiteral("vad/snr_db"), 3).toInt();
-        text_mode_ = settings_.value(QStringLiteral("text/mode"), 1).toInt() == 0
-            ? TextMode::Raw
-            : TextMode::Clean;
-        const int profile_version = settings_.value(QStringLiteral("vad/profile_version"), 0).toInt();
-        if (profile_version < 4 && vad_settings_.endpoint_ms == 700 &&
-            vad_settings_.threshold_percent == 80 && vad_settings_.minimum_db == -45 &&
-            vad_settings_.snr_db == 8) {
-            vad_settings_ = {};
-            settings_.setValue(QStringLiteral("vad/endpoint_ms"), vad_settings_.endpoint_ms);
-            settings_.setValue(QStringLiteral("vad/threshold_percent"), vad_settings_.threshold_percent);
-            settings_.setValue(QStringLiteral("vad/minimum_db"), vad_settings_.minimum_db);
-            settings_.setValue(QStringLiteral("vad/snr_db"), vad_settings_.snr_db);
-        }
-        // Profile 5: macOS moved from 700 ms to a longer sentence-end silence;
-        // only an untouched old default is migrated.
-        if (profile_version < 5 && vad_settings_.endpoint_ms == 700 && default_endpoint_ms != 700) {
-            vad_settings_.endpoint_ms = default_endpoint_ms;
-            settings_.setValue(QStringLiteral("vad/endpoint_ms"), vad_settings_.endpoint_ms);
-        }
-        settings_.setValue(QStringLiteral("vad/profile_version"), 5);
-        settings_.sync();
-        translation_settings_.enabled =
-            settings_.value(QStringLiteral("translation/enabled"), false).toBool();
-        const QByteArray direction_code_value = settings_.value(
-            QStringLiteral("translation/direction"), QStringLiteral("zh-en")).toString().toLatin1();
-        translation_settings_.direction = parse_direction_code(direction_code_value.constData())
-            .value_or(TranslationDirection::ZhToEn);
-        // Translation defaults to Auto, not to the recognition device: an
-        // existing install upgrades without silently changing where it runs.
-        translation_settings_.device = parse_compute_policy(settings_.value(
-            QString::fromLatin1(translation_compute_policy_settings_key),
-            QStringLiteral("auto")).toString().toStdString()).value_or(ComputePolicy::Auto);
-        translation_settings_.separator = sanitizedSeparator(settings_.value(
-            QStringLiteral("translation/separator"),
-            QString::fromLatin1(default_translation_separator)).toString());
-        speech_settings_.enabled = settings_.value(QStringLiteral("speech/enabled"), false).toBool();
-        // Speakers stay audible by default. Users who rely on the virtual audio
-        // cable can turn muting on in Settings > Input > Audio or the tray menu.
-        constexpr bool default_mute_while_recording = false;
-        mute_while_recording_ = settings_.value(
-            QStringLiteral("audio/mute_while_recording"), default_mute_while_recording).toBool();
-        speech_settings_.device_id = settings_.value(QStringLiteral("speech/device_id")).toString();
-        speech_settings_.monitor = settings_.value(QStringLiteral("speech/monitor"), false).toBool();
-        speech_settings_.voice_zh =
-            settings_.value(QStringLiteral("speech/voice_zh"), default_speech_voice_zh).toInt();
-        speech_settings_.voice_en =
-            settings_.value(QStringLiteral("speech/voice_en"), default_speech_voice_en).toInt();
-        speech_settings_.speed_percent =
-            std::clamp(settings_.value(QStringLiteral("speech/speed_percent"), 100).toInt(), 50, 200);
-        speech_settings_.live = settings_.value(QStringLiteral("speech/live"), false).toBool();
-        hotkey_shortcut_ = canonicalShortcut(settings_.value(
-            QStringLiteral("hotkey/shortcut"), QString::fromLatin1(default_hotkey)).toString());
-        if (!hasUsableShortcutKey(hotkey_shortcut_)) {
-            hotkey_shortcut_ = QString::fromLatin1(default_hotkey);
-        }
-        startup_enabled_ = platformStartupEnabled();
-        // Older builds stored one combined value; map it onto destination + content.
-        const QString destination_value =
-            settings_.value(QStringLiteral("output/destination"), QStringLiteral("insert")).toString();
-        result_destination_ = destination_value == QStringLiteral("insert")
-            ? ResultDestination::Insert : ResultDestination::CopyOnly;
-        ResultContent legacy_content = translation_settings_.enabled ? ResultContent::Both : ResultContent::Original;
-        if (destination_value == QStringLiteral("copy-translation")) legacy_content = ResultContent::Translation;
-        else if (destination_value == QStringLiteral("copy-both")) legacy_content = ResultContent::Both;
-        else if (destination_value == QStringLiteral("copy-original")) legacy_content = ResultContent::Original;
-        result_content_ = settings_.contains(QStringLiteral("output/content"))
-            ? resultContentFromName(settings_.value(QStringLiteral("output/content")).toString())
-            : legacy_content;
-        clipboard_content_ = settings_.contains(QStringLiteral("output/clipboard_content"))
-            ? resultContentFromName(settings_.value(QStringLiteral("output/clipboard_content")).toString())
-            : result_content_;
-        const QString trigger_value =
-            settings_.value(QStringLiteral("hotkey/trigger")).toString();
-        hotkey_trigger_ = trigger_value == QStringLiteral("realtime") ? HotkeyTrigger::Realtime
-            : trigger_value == QStringLiteral("toggle") ? HotkeyTrigger::Toggle
-                                                        : HotkeyTrigger::Hold;
-        paste_delay_ms_ = std::clamp(settings_.value(
-            QStringLiteral("output/paste_delay_ms"), default_paste_delay_ms).toInt(), 0, maximum_paste_delay_ms);
-        clipboard_ttl_seconds_ = std::clamp(settings_.value(
-            QStringLiteral("output/clipboard_ttl_seconds"), 0).toInt(), 0, 600);
-        const AppearanceSettings defaults;
-        appearance_.preset = themePresetFromName(settings_.value(
-            QStringLiteral("appearance/preset"), themePresetName(defaults.preset)).toString());
-        const auto load_color = [this](const QString& key, const QColor& fallback) {
-            const QColor color(settings_.value(key, fallback.name()).toString());
-            return color.isValid() ? color : fallback;
-        };
-        appearance_.custom.background =
-            load_color(QStringLiteral("appearance/custom_background"), defaults.custom.background);
-        appearance_.custom.text =
-            load_color(QStringLiteral("appearance/custom_text"), defaults.custom.text);
-        appearance_.custom.accent =
-            load_color(QStringLiteral("appearance/custom_accent"), defaults.custom.accent);
-        appearance_.custom_font_family =
-            settings_.value(QStringLiteral("appearance/custom_font_family")).toString();
-        appearance_.custom_font_size = std::clamp(
-            settings_.value(QStringLiteral("appearance/custom_font_size"), defaults.custom_font_size).toInt(), 8, 24);
-        const int linger_ms = settings_.value(QStringLiteral("appearance/linger_ms"), defaults.linger_ms).toInt();
-        appearance_.linger_ms = std::clamp(linger_ms / linger_step_ms * linger_step_ms, 0, linger_maximum_ms);
-        appearance_.pinned = settings_.value(QStringLiteral("appearance/pinned"), defaults.pinned).toBool();
+        const SettingsLoadResult loaded = loadSettingsSnapshot(SettingsLoadInputs{
+            settings_, hotwordsPath(false), platformStartupEnabled(), bubble_style_});
+        vad_settings_ = loaded.snapshot.vad;
+        compute_policy_ = loaded.snapshot.compute;
+        text_mode_ = loaded.snapshot.mode;
+        hotkey_shortcut_ = loaded.snapshot.shortcut;
+        result_destination_ = loaded.snapshot.destination;
+        result_content_ = loaded.snapshot.popup_content;
+        clipboard_content_ = loaded.snapshot.clipboard_content;
+        hotkey_trigger_ = loaded.snapshot.trigger;
+        paste_delay_ms_ = loaded.snapshot.paste_delay_ms;
+        clipboard_ttl_seconds_ = loaded.snapshot.clipboard_ttl_seconds;
+        startup_enabled_ = loaded.snapshot.startup_enabled;
+        mute_while_recording_ = loaded.snapshot.mute_while_recording;
+        translation_settings_ = loaded.snapshot.translation;
+        speech_settings_ = loaded.snapshot.speech;
+        appearance_ = loaded.snapshot.appearance;
+        model_choices_ = loaded.snapshot.model_choices;
+        if (!loaded.migrations.empty()) migrateSettings(settings_, loaded);
+        applyModelLocations();
     }
 
     void saveAppearanceSettings() {
@@ -3427,27 +3497,6 @@ private:
                 hidePopup();
             }
         });
-    }
-
-    void loadModelChoices() {
-        for (const auto& [group, map] : {std::pair{QStringLiteral("models/recognizer"), &model_choices_.recognizer},
-                                         std::pair{QStringLiteral("models/voice"), &model_choices_.voice}}) {
-            settings_.beginGroup(group);
-            for (const QString& key : settings_.childKeys()) map->insert(key, settings_.value(key).toString());
-            settings_.endGroup();
-        }
-        model_choices_.translator =
-            settings_.value(QStringLiteral("models/translator"), QStringLiteral("auto")).toString();
-        model_choices_.custom_directory =
-            settings_.value(QStringLiteral("models/custom_directory")).toString();
-        model_choices_.custom_paths.clear();
-        settings_.beginGroup(QStringLiteral("models/custom_paths"));
-        for (const QString& key : settings_.childKeys()) {
-            const QString path = settings_.value(key).toString();
-            if (!path.isEmpty()) model_choices_.custom_paths.insert(key, path);
-        }
-        settings_.endGroup();
-        applyModelLocations();
     }
 
     // Push the user's extra model locations into the manager. Used after
@@ -3543,7 +3592,7 @@ private:
                 applyAppearance();
                 saveAppearanceSettings();
             },
-            model_manager_, model_choices_,
+            model_manager_, model_choices_, settingsEnvironmentFromSystem(),
             this);
         if (dialog.exec() == QDialog::Accepted) {
             // A device change must rebuild the engine; do it after the dialog
@@ -5421,6 +5470,59 @@ private:
 
 } // namespace
 
+#ifdef SENSEVOICE_UI_TESTING
+namespace sa::settings {
+
+QWidget* createSettingsDialogForTest(const SettingsSnapshot& snapshot,
+                                     const SettingsEnvironment& environment,
+                                     ModelManager* model_manager) {
+    return new InputSettingsDialog(
+        snapshot.vad, snapshot.compute, snapshot.translation.device, snapshot.shortcut,
+        snapshot.mode, snapshot.trigger, snapshot.destination, snapshot.popup_content,
+        snapshot.clipboard_content, snapshot.paste_delay_ms, snapshot.clipboard_ttl_seconds,
+        snapshot.startup_enabled, snapshot.mute_while_recording, snapshot.hotwords,
+        snapshot.translation, snapshot.speech, snapshot.appearance, snapshot.bubble_style, {},
+        model_manager, snapshot.model_choices, environment, nullptr);
+}
+
+int settingsPageCountForTest(QWidget* dialog) {
+    return static_cast<InputSettingsDialog*>(dialog)->pageCount();
+}
+
+void settingsSelectPageForTest(QWidget* dialog, int index) {
+    static_cast<InputSettingsDialog*>(dialog)->selectPage(index);
+}
+
+int settingsCurrentPageForTest(QWidget* dialog) {
+    return static_cast<InputSettingsDialog*>(dialog)->currentPage();
+}
+
+SettingsDraft settingsDraftForTest(QWidget* dialog) {
+    auto* settings = static_cast<InputSettingsDialog*>(dialog);
+    SettingsDraft draft;
+    draft.vad = settings->values();
+    draft.compute = settings->computePolicy();
+    draft.shortcut = settings->shortcut();
+    draft.mode = settings->mode();
+    draft.trigger = settings->trigger();
+    draft.destination = settings->destination();
+    draft.popup_content = settings->inputContent();
+    draft.clipboard_content = settings->clipboardContent();
+    draft.paste_delay_ms = settings->pasteDelayMs();
+    draft.clipboard_ttl_seconds = settings->clipboardTtlSeconds();
+    draft.startup_enabled = settings->startupEnabled();
+    draft.mute_while_recording = settings->muteWhileRecording();
+    draft.hotwords = settings->hotwords();
+    draft.translation = settings->translation();
+    draft.speech = settings->speech();
+    draft.model_choices = settings->modelChoices();
+    return draft;
+}
+
+} // namespace sa::settings
+#endif
+
+#ifndef SENSEVOICE_UI_TESTING
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     // Match the manifest's active code page so the CRT and the narrow-path
@@ -5557,9 +5659,8 @@ int main(int argc, char* argv[]) {
                                    new ModelManager(packagedModelsDirectory(),
                                                     &application));
         dialog.show();
-        auto* stack = dialog.findChild<QStackedWidget*>(QStringLiteral("settingsStack"));
-        for (int tab = 0; stack != nullptr && tab < stack->count(); ++tab) {
-            stack->setCurrentIndex(tab);
+        for (int tab = 0; tab < dialog.pageCount(); ++tab) {
+            dialog.selectPage(tab);
             application.processEvents();
             dialog.grab().save(QDir(preview_settings_dir).filePath(QStringLiteral("settings-%1.png").arg(tab)));
         }
@@ -5585,3 +5686,4 @@ int main(int argc, char* argv[]) {
 #endif
     return exit_code;
 }
+#endif

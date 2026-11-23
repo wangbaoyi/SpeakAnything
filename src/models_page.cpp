@@ -1,6 +1,7 @@
 #include "models_page.h"
 
 #include "languages.h"
+#include "ui/design_tokens.h"
 
 #include <QCoreApplication>
 #include <QComboBox>
@@ -8,6 +9,7 @@
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFont>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -31,6 +33,35 @@ QString language_label(const QString& code) {
     const LanguageInfo* language = find_language(code.toStdString());
     return language == nullptr ? code : QString::fromUtf8(language->native_name.data(),
                                                           static_cast<qsizetype>(language->native_name.size()));
+}
+
+QString kind_key(ModelKind kind) {
+    switch (kind) {
+    case ModelKind::Recognizer: return QStringLiteral("recognizer");
+    case ModelKind::Translator: return QStringLiteral("translator");
+    case ModelKind::Voice: return QStringLiteral("voice");
+    }
+    return QStringLiteral("recognizer");
+}
+
+void apply_card_title_font(QLabel* label) {
+    QFont font = label->font();
+    font.setPixelSize(sa::ui::card_title_size);
+    font.setWeight(QFont::DemiBold);
+    label->setFont(font);
+}
+
+void apply_hint_font(QLabel* label) {
+    QFont font = label->font();
+    font.setPixelSize(sa::ui::hint_size);
+    label->setFont(font);
+}
+
+QWidget* row_container() {
+    auto* container = new QWidget;
+    container->setObjectName(QStringLiteral("row"));
+    container->setMinimumHeight(sa::ui::row_min_height);
+    return container;
 }
 
 } // namespace
@@ -87,31 +118,46 @@ void ModelsPage::addDirectoryControls() {
     auto* card = new QFrame;
     card->setObjectName(QStringLiteral("card"));
     auto* layout = new QVBoxLayout(card);
-    layout->setContentsMargins(16, 14, 16, 14);
-    layout->setSpacing(8);
+    layout->setContentsMargins(16, 14, 16, 16);
+    layout->setSpacing(10);
     auto* heading = new QLabel(QCoreApplication::translate("SpeakAnything", "模型目录"));
     heading->setObjectName(QStringLiteral("cardTitle"));
+    apply_card_title_font(heading);
     layout->addWidget(heading);
     auto* hint = new QLabel(QCoreApplication::translate("SpeakAnything",
         "默认在可执行目录下的 modelspt 文件夹查找。已经下载到其他位置的模型，"
         "可以选择它们所在的目录，或在下面对应的模型上点“导入”。"));
     hint->setObjectName(QStringLiteral("cardHint"));
     hint->setWordWrap(true);
+    apply_hint_font(hint);
     layout->addWidget(hint);
 
+    auto* path_row = row_container();
+    auto* path_layout = new QVBoxLayout(path_row);
+    path_layout->setContentsMargins(0, 4, 0, 4);
     directory_label_ = new QLabel;
+    directory_label_->setObjectName(QStringLiteral("models_directory_label"));
     directory_label_->setWordWrap(true);
     directory_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     directory_label_->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
-    layout->addWidget(directory_label_);
+    QFont path_font = directory_label_->font();
+    path_font.setPixelSize(sa::ui::body_size);
+    directory_label_->setFont(path_font);
+    path_layout->addWidget(directory_label_);
+    layout->addWidget(path_row);
 
-    auto* controls = new QHBoxLayout;
+    auto* controls_container = row_container();
+    auto* controls = new QHBoxLayout(controls_container);
+    controls->setContentsMargins(0, 0, 0, 0);
+    controls->setSpacing(8);
     auto* choose = new QPushButton(QCoreApplication::translate("SpeakAnything", "选择目录..."));
+    choose->setObjectName(QStringLiteral("models_directory_choose"));
     auto* reset = new QPushButton(QCoreApplication::translate("SpeakAnything", "恢复默认"));
+    reset->setObjectName(QStringLiteral("models_directory_reset"));
     controls->addWidget(choose);
     controls->addWidget(reset);
     controls->addStretch();
-    layout->addLayout(controls);
+    layout->addWidget(controls_container);
     static_cast<QVBoxLayout*>(this->layout())->addWidget(card);
 
     connect(choose, &QPushButton::clicked, this, [this] { chooseDirectory(); });
@@ -212,37 +258,86 @@ void ModelsPage::importModel(Row& row) {
 }
 
 void ModelsPage::addRow(Row& row, const QString& title, const QString& hint) {
+    const QString key = QStringLiteral("models_") + kind_key(row.kind);
     auto* card = new QFrame;
     card->setObjectName(QStringLiteral("card"));
     auto* layout = new QVBoxLayout(card);
-    layout->setContentsMargins(16, 14, 16, 14);
-    layout->setSpacing(8);
+    layout->setContentsMargins(16, 14, 16, 16);
+    layout->setSpacing(10);
+
+    auto* header = new QHBoxLayout;
+    header->setSpacing(12);
     auto* heading = new QLabel(title);
     heading->setObjectName(QStringLiteral("cardTitle"));
-    layout->addWidget(heading);
+    apply_card_title_font(heading);
+    header->addWidget(heading);
+    header->addStretch();
+    row.state = new QLabel;
+    row.state->setObjectName(key + QStringLiteral("_state"));
+    row.state->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    row.state->setStyleSheet(QStringLiteral(
+        "QLabel { color: palette(placeholder-text); background: rgba(128, 128, 128, 0.10); "
+        "border-radius: 9px; padding: 2px 8px; }"));
+    apply_hint_font(row.state);
+    header->addWidget(row.state);
+    layout->addLayout(header);
+
     auto* hint_label = new QLabel(hint);
     hint_label->setObjectName(QStringLiteral("cardHint"));
     hint_label->setWordWrap(true);
+    apply_hint_font(hint_label);
     layout->addWidget(hint_label);
 
-    auto* controls = new QHBoxLayout;
+    row.status = new QLabel;
+    row.status->setObjectName(key + QStringLiteral("_status"));
+    row.status->setWordWrap(true);
+    row.status->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
+    apply_hint_font(row.status);
+    layout->addWidget(row.status);
+
+    auto* combo_row = row_container();
+    auto* combo_layout = new QHBoxLayout(combo_row);
+    combo_layout->setContentsMargins(0, 0, 0, 0);
+    combo_layout->setSpacing(8);
     row.combo = new QComboBox;
+    row.combo->setObjectName(key + QStringLiteral("_combo"));
+    row.combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    row.combo->setMinimumContentsLength(14);
+    combo_layout->addWidget(row.combo, 1);
+    layout->addWidget(combo_row);
+
+    auto* actions_row = row_container();
+    row.actions = actions_row;
+    auto* actions = new QHBoxLayout(actions_row);
+    actions->setContentsMargins(0, 0, 0, 0);
+    actions->setSpacing(8);
     row.download = new QPushButton(QCoreApplication::translate("SpeakAnything", "下载"));
+    row.download->setObjectName(key + QStringLiteral("_download"));
     row.browser = new QPushButton(QCoreApplication::translate("SpeakAnything", "浏览器下载"));
+    row.browser->setObjectName(key + QStringLiteral("_browser"));
     row.import_button = new QPushButton(QCoreApplication::translate("SpeakAnything", "导入..."));
+    row.import_button->setObjectName(key + QStringLiteral("_import"));
     row.import_button->setToolTip(QCoreApplication::translate("SpeakAnything",
         "使用已经下载好的模型文件或文件夹"));
     row.remove = new QPushButton(QCoreApplication::translate("SpeakAnything", "删除"));
-    controls->addWidget(row.combo, 1);
-    controls->addWidget(row.download);
-    controls->addWidget(row.browser);
-    controls->addWidget(row.import_button);
-    controls->addWidget(row.remove);
-    layout->addLayout(controls);
-    row.status = new QLabel;
-    row.status->setStyleSheet(QStringLiteral("color: palette(placeholder-text);"));
-    layout->addWidget(row.status);
+    row.remove->setObjectName(key + QStringLiteral("_remove"));
+    row.remove->setToolTip(QCoreApplication::translate("SpeakAnything",
+        "删除后需要重新下载"));
+    row.delete_hint = new QLabel(QCoreApplication::translate("SpeakAnything",
+        "删除后需重新下载"));
+    row.delete_hint->setObjectName(QStringLiteral("cardHint"));
+    row.delete_hint->setVisible(false);
+    apply_hint_font(row.delete_hint);
+    actions->addWidget(row.download);
+    actions->addWidget(row.browser);
+    actions->addWidget(row.import_button);
+    actions->addWidget(row.remove);
+    actions->addWidget(row.delete_hint);
+    actions->addStretch();
+    layout->addWidget(actions_row);
+
     row.progress = new QProgressBar;
+    row.progress->setObjectName(key + QStringLiteral("_progress"));
     row.progress->setTextVisible(false);
     row.progress->setFixedHeight(6);
     row.progress->setVisible(false);
@@ -352,10 +447,13 @@ void ModelsPage::refresh(Row& row) {
                   .arg(language_label(language(row)))
             : QCoreApplication::translate("SpeakAnything", "%1 还没有可用的模型，请选择一个下载。")
                   .arg(language_label(language(row))));
+        row.state->setText(QCoreApplication::translate("SpeakAnything", "自动"));
         row.download->setVisible(false);
         row.browser->setVisible(false);
         row.import_button->setVisible(false);
         row.remove->setVisible(false);
+        row.delete_hint->setVisible(false);
+        row.actions->setVisible(false);
         row.progress->setVisible(false);
         return;
     }
@@ -369,10 +467,22 @@ void ModelsPage::refresh(Row& row) {
     row.import_button->setVisible(!busy && model->engine != ModelEngine::SystemVoice);
     row.import_button->setText(imported ? QCoreApplication::translate("SpeakAnything", "重新导入...")
                                  : QCoreApplication::translate("SpeakAnything", "导入..."));
-    row.remove->setVisible(installed && !busy && (!model->bundled || imported));
+    const bool removable = installed && !busy && (!model->bundled || imported);
+    row.remove->setVisible(removable);
     row.remove->setText(imported ? QCoreApplication::translate("SpeakAnything", "移除导入")
                                  : QCoreApplication::translate("SpeakAnything", "删除"));
+    row.delete_hint->setVisible(removable && !imported);
+    row.actions->setVisible(!row.download->isHidden() || !row.browser->isHidden() ||
+                            !row.import_button->isHidden() || !row.remove->isHidden());
     row.progress->setVisible(busy);
+    row.state->setText(busy
+        ? QCoreApplication::translate("SpeakAnything", "下载中")
+        : imported
+        ? QCoreApplication::translate("SpeakAnything", "已导入")
+        : installed
+        ? (model->bundled ? QCoreApplication::translate("SpeakAnything", "已内置")
+                          : QCoreApplication::translate("SpeakAnything", "已下载"))
+        : QCoreApplication::translate("SpeakAnything", "需下载"));
     row.status->setText(imported
         ? QCoreApplication::translate("SpeakAnything", "已导入：%1").arg(custom)
         : installed

@@ -1,4 +1,5 @@
-<?xml version='1.0' encoding='utf-8'?>
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE TS>
 <TS version="2.1" language="en" sourcelanguage="zh_CN">
 <context>
     <name>SpeakAnything</name>
@@ -127,12 +128,8 @@
         <translation>Record a combination that includes a regular key, e.g. Ctrl + Alt + Space.</translation>
     </message>
     <message>
-        <source>配色主题与字体</source>
-        <translation>Color theme and font</translation>
-    </message>
-    <message>
         <source>默认（各浮窗样式原有配色）</source>
-        <translation>Default (each popup style's own colors)</translation>
+        <translation>Default (each popup style&apos;s own colors)</translation>
     </message>
     <message>
         <source>亮色</source>
@@ -175,12 +172,8 @@
         <translation>How long to stay visible after recognition</translation>
     </message>
     <message>
-        <source>常驻显示（按快捷键唤出后不自动隐藏，点浮窗上的 × 关闭）</source>
-        <translation>Always visible (stays after the shortcut opens it; close with × on the popup)</translation>
-    </message>
-    <message>
         <source>外观修改即时生效，不需要点“应用”，点“取消”也不会撤回。</source>
-        <translation>Appearance changes apply immediately; you don't need to click “Apply”, and “Cancel” won't undo them.</translation>
+        <translation>Appearance changes apply immediately; you don&apos;t need to click “Apply”, and “Cancel” won&apos;t undo them.</translation>
     </message>
     <message>
         <source>快捷键</source>
@@ -207,10 +200,6 @@
         <translation>Trigger</translation>
     </message>
     <message>
-        <source>切换方式下，文字输入到第二次按快捷键时光标所在的位置，最长录音 5 分钟。</source>
-        <translation>In toggle mode, text goes to wherever the cursor is when you press the shortcut the second time. Recording is limited to 5 minutes.</translation>
-    </message>
-    <message>
         <source>按住说话：按住开始，松开结束</source>
         <translation>Hold to talk: hold to start, release to finish</translation>
     </message>
@@ -232,7 +221,7 @@
     </message>
     <message>
         <source>使用当前用户的 Windows 启动项注册，不需要管理员权限。</source>
-        <translation>Registered in the current user's Windows startup entries; no administrator rights needed.</translation>
+        <translation>Registered in the current user&apos;s Windows startup entries; no administrator rights needed.</translation>
     </message>
     <message>
         <source>文字整理</source>
@@ -279,10 +268,6 @@
         <translation>Popup content</translation>
     </message>
     <message>
-        <source>放进剪贴板的文字；输入到光标位置的也是这一段。</source>
-        <translation>Text placed on the clipboard; this is also what gets typed at the cursor.</translation>
-    </message>
-    <message>
         <source>剪贴板内容</source>
         <translation>Clipboard content</translation>
     </message>
@@ -296,7 +281,7 @@
     </message>
     <message>
         <source>目标程序不支持直接输入时，等待这段时间后按 %1 粘贴。只在「输入到光标位置」时生效。</source>
-        <translation>When the target app doesn't accept direct input, wait this long and then press %1 to paste. Only applies to “Type at the cursor”.</translation>
+        <translation>When the target app doesn&apos;t accept direct input, wait this long and then press %1 to paste. Only applies to “Type at the cursor”.</translation>
     </message>
     <message>
         <source>粘贴延迟</source>
@@ -321,10 +306,6 @@
     <message>
         <source>英文 → 中文</source>
         <translation>English → Chinese</translation>
-    </message>
-    <message>
-        <source>原文与译文之间的分隔符</source>
-        <translation>Separator between original and translation</translation>
     </message>
     <message>
         <source>模型</source>
@@ -352,7 +333,7 @@
     </message>
     <message>
         <source>翻译失败、超时或说的语言与方向不符时，只输入原文。</source>
-        <translation>If translation fails, times out, or you speak a language that doesn't match the direction, only the original is typed.</translation>
+        <translation>If translation fails, times out, or you speak a language that doesn&apos;t match the direction, only the original is typed.</translation>
     </message>
     <message>
         <source>朗读译文</source>
@@ -368,7 +349,7 @@
     </message>
     <message>
         <source>边说边朗读：每句翻译好就开始念，不等松开快捷键</source>
-        <translation>Speak while I talk: say each sentence as soon as it's translated, without waiting for the key release</translation>
+        <translation>Speak while I talk: say each sentence as soon as it&apos;s translated, without waiting for the key release</translation>
     </message>
     <message>
         <source>说话中间停顿时，前面的句子就会被翻译并念出来。按 Esc 可取消还没念出的部分。</source>
@@ -408,7 +389,7 @@
     </message>
     <message>
         <source>录音期间自动静音，避免被重新录进去。</source>
-        <translation>Muted automatically while recording so it isn't picked up again.</translation>
+        <translation>Muted automatically while recording so it isn&apos;t picked up again.</translation>
     </message>
     <message>
         <source>声音</source>
@@ -464,7 +445,7 @@
     </message>
     <message>
         <source>不翻译</source>
-        <translation>Don't translate</translation>
+        <translation>Don&apos;t translate</translation>
     </message>
     <message>
         <source>添加热词</source>
@@ -548,11 +529,11 @@
     </message>
     <message>
         <source>文字逐步变长时窗口视觉中心应该保持不动</source>
-        <translation>As text grows, the window's visual center should stay put</translation>
+        <translation>As text grows, the window&apos;s visual center should stay put</translation>
     </message>
     <message>
         <source>文字逐步变长时窗口视觉中心应该保持不动，底边也应该保持不动。</source>
-        <translation>As text grows, the window's visual center should stay put, and so should its bottom edge.</translation>
+        <translation>As text grows, the window&apos;s visual center should stay put, and so should its bottom edge.</translation>
     </message>
     <message>
         <source>这是一个更长的预览句子，用来验证窗口宽高动画不会导致水平抖动。</source>
@@ -580,7 +561,7 @@
     </message>
     <message>
         <source>用扬声器时开启，避免声音被重新录进去；戴耳机时可以关闭。</source>
-        <translation>Turn on when using speakers so playback isn't picked up again; leave off with headphones.</translation>
+        <translation>Turn on when using speakers so playback isn&apos;t picked up again; leave off with headphones.</translation>
     </message>
     <message>
         <source>停止朗读</source>
@@ -608,7 +589,7 @@
     </message>
     <message>
         <source>注入失败，已复制到剪贴板</source>
-        <translation>Couldn't type it; copied to the clipboard</translation>
+        <translation>Couldn&apos;t type it; copied to the clipboard</translation>
     </message>
     <message>
         <source>按 %1 开始说话</source>
@@ -632,15 +613,15 @@
     </message>
     <message>
         <source>开机启动设置失败</source>
-        <translation>Couldn't set launch at login</translation>
+        <translation>Couldn&apos;t set launch at login</translation>
     </message>
     <message>
         <source>无法注册登录项。</source>
-        <translation>Couldn't register the login item.</translation>
+        <translation>Couldn&apos;t register the login item.</translation>
     </message>
     <message>
         <source>无法写入当前用户的 Windows 启动项。</source>
-        <translation>Couldn't write the current user's Windows startup entry.</translation>
+        <translation>Couldn&apos;t write the current user&apos;s Windows startup entry.</translation>
     </message>
     <message>
         <source>热词未保存</source>
@@ -656,7 +637,7 @@
     </message>
     <message>
         <source>按住快捷键监听失败，请点击开始</source>
-        <translation>Couldn't monitor the held shortcut; click Start instead</translation>
+        <translation>Couldn&apos;t monitor the held shortcut; click Start instead</translation>
     </message>
     <message>
         <source>系统快捷键被占用，请在设置中更换</source>
@@ -684,7 +665,7 @@
     </message>
     <message>
         <source>无法暂时静音系统播放：%1</source>
-        <translation>Couldn't temporarily mute system playback: %1</translation>
+        <translation>Couldn&apos;t temporarily mute system playback: %1</translation>
     </message>
     <message>
         <source>麦克风不可用</source>
@@ -752,7 +733,7 @@
     </message>
     <message>
         <source>语种与方向不符，已输入原文</source>
-        <translation>Language doesn't match the direction; typed the original</translation>
+        <translation>Language doesn&apos;t match the direction; typed the original</translation>
     </message>
     <message>
         <source>翻译失败，已输入原文</source>
@@ -827,10 +808,6 @@ Hold Ctrl + Win to record; on release the text goes to the last cursor position.
         <translation>Kokoro speaks Chinese and English; other languages use a Piper voice, downloaded per language.</translation>
     </message>
     <message>
-        <source>自动：使用已安装的最快模型（神经网络引擎 &gt; GPU &gt; CPU）。下载的模型保存在：%1</source>
-        <translation>Automatic uses the fastest installed model (Neural Engine &gt; GPU &gt; CPU). Downloads are stored in: %1</translation>
-    </message>
-    <message>
         <source>下载失败</source>
         <translation>Download failed</translation>
     </message>
@@ -899,10 +876,6 @@ Hold Ctrl + Win to record; on release the text goes to the last cursor position.
         <translation>GPU only (fails to load when unavailable)</translation>
     </message>
     <message>
-        <source>推理设备</source>
-        <translation>Inference device</translation>
-    </message>
-    <message>
         <source>检测到：%1（%2，显存 %3 GB）</source>
         <translation>Detected: %1 (%2, %3 GB VRAM)</translation>
     </message>
@@ -913,6 +886,324 @@ Hold Ctrl + Win to record; on release the text goes to the last cursor position.
     <message>
         <source>正在重新加载模型...</source>
         <translation>Reloading the model...</translation>
+    </message>
+    <message>
+        <source>自动：使用已安装的最快模型（神经网络引擎 &gt; GPU &gt; CPU）。程序优先使用可执行目录下的 modelspt 文件夹；也可以选择自定义目录，或在下面对应的模型上点“导入”。当前下载目录：%1</source>
+        <translation>Auto: uses the fastest installed model (Neural Engine &gt; GPU &gt; CPU). The program prefers the modelspt folder next to the executable; you can also choose a custom folder or click “Import” on a model below. Current download folder: %1</translation>
+    </message>
+    <message>
+        <source>模型目录</source>
+        <translation>Model folder</translation>
+    </message>
+    <message>
+        <source>默认在可执行目录下的 modelspt 文件夹查找。已经下载到其他位置的模型，可以选择它们所在的目录，或在下面对应的模型上点“导入”。</source>
+        <translation>By default models are looked up in the modelspt folder next to the executable. For models downloaded elsewhere, choose the folder that contains them or click “Import” on the model below.</translation>
+    </message>
+    <message>
+        <source>选择目录...</source>
+        <translation>Choose folder...</translation>
+    </message>
+    <message>
+        <source>当前：%1</source>
+        <translation>Current: %1</translation>
+    </message>
+    <message>
+        <source>自定义：%1
+默认：%2</source>
+        <translation>Custom: %1
+Default: %2</translation>
+    </message>
+    <message>
+        <source>选择存放模型的目录</source>
+        <translation>Choose a folder for models</translation>
+    </message>
+    <message>
+        <source>导入模型</source>
+        <translation>Import model</translation>
+    </message>
+    <message>
+        <source>请先在列表中选择一个具体模型。</source>
+        <translation>Select a specific model in the list first.</translation>
+    </message>
+    <message>
+        <source>选择模型文件夹</source>
+        <translation>Choose a model folder</translation>
+    </message>
+    <message>
+        <source>这个文件夹里没有 %1，无法作为该模型使用。</source>
+        <translation>This folder has no %1, so it cannot be used for this model.</translation>
+    </message>
+    <message>
+        <source>Whisper 模型 (*.bin);;所有文件 (*)</source>
+        <translation>Whisper models (*.bin);;All files (*)</translation>
+    </message>
+    <message>
+        <source>模型文件 (*.gguf *.bin);;所有文件 (*)</source>
+        <translation>Model files (*.gguf *.bin);;All files (*)</translation>
+    </message>
+    <message>
+        <source>选择模型文件</source>
+        <translation>Choose a model file</translation>
+    </message>
+    <message>
+        <source>%1 需要 %2 文件，选中的是 %3。</source>
+        <translation>%1 requires a %2 file; you selected %3.</translation>
+    </message>
+    <message>
+        <source>浏览器下载</source>
+        <translation>Download in browser</translation>
+    </message>
+    <message>
+        <source>导入...</source>
+        <translation>Import...</translation>
+    </message>
+    <message>
+        <source>使用已经下载好的模型文件或文件夹</source>
+        <translation>Use an already downloaded model file or folder</translation>
+    </message>
+    <message>
+        <source>删除后需要重新下载</source>
+        <translation>Must be downloaded again after deletion</translation>
+    </message>
+    <message>
+        <source>删除后需重新下载</source>
+        <translation>Requires re-download after deletion</translation>
+    </message>
+    <message>
+        <source>重新导入...</source>
+        <translation>Re-import...</translation>
+    </message>
+    <message>
+        <source>移除导入</source>
+        <translation>Remove import</translation>
+    </message>
+    <message>
+        <source>下载中</source>
+        <translation>Downloading</translation>
+    </message>
+    <message>
+        <source>已导入</source>
+        <translation>Imported</translation>
+    </message>
+    <message>
+        <source>需下载</source>
+        <translation>Download needed</translation>
+    </message>
+    <message>
+        <source>已导入：%1</source>
+        <translation>Imported: %1</translation>
+    </message>
+    <message>
+        <source>设置导航</source>
+        <translation>Settings navigation</translation>
+    </message>
+    <message>
+        <source>语音输入</source>
+        <translation>Voice input</translation>
+    </message>
+    <message>
+        <source>语音能力</source>
+        <translation>Voice features</translation>
+    </message>
+    <message>
+        <source>资源</source>
+        <translation>Resources</translation>
+    </message>
+    <message>
+        <source>个性化</source>
+        <translation>Personalization</translation>
+    </message>
+    <message>
+        <source>配色主题</source>
+        <translation>Color theme</translation>
+    </message>
+    <message>
+        <source>主题决定浮窗的配色；选择“自定义”后可单独调整颜色和字体。</source>
+        <translation>The theme controls the overlay palette; choose “Custom” to adjust colors and fonts separately.</translation>
+    </message>
+    <message>
+        <source>主题</source>
+        <translation>Theme</translation>
+    </message>
+    <message>
+        <source>颜色</source>
+        <translation>Colors</translation>
+    </message>
+    <message>
+        <source>点色块选择颜色，十六进制值显示在旁边。</source>
+        <translation>Click a swatch to choose a color; the hex value appears beside it.</translation>
+    </message>
+    <message>
+        <source>字号</source>
+        <translation>Font size</translation>
+    </message>
+    <message>
+        <source>常驻显示</source>
+        <translation>Always visible</translation>
+    </message>
+    <message>
+        <source>按快捷键唤出后不自动隐藏，点浮窗上的 × 关闭。</source>
+        <translation>Stays on screen after the shortcut opens it; click × on the overlay to close.</translation>
+    </message>
+    <message>
+        <source>背景颜色</source>
+        <translation>Background color</translation>
+    </message>
+    <message>
+        <source>文字颜色</source>
+        <translation>Text color</translation>
+    </message>
+    <message>
+        <source>识别设备</source>
+        <translation>Recognition device</translation>
+    </message>
+    <message>
+        <source>切换方式最长 5 分钟；实时方式会一直保持麦克风开启，直到再按一次快捷键或按 Esc。</source>
+        <translation>Toggle mode stops after 5 minutes; realtime mode keeps the microphone open until you press the shortcut again or press Esc.</translation>
+    </message>
+    <message>
+        <source>实时模式：按一下开始，边说边输出，再按一下结束</source>
+        <translation>Realtime: press once to start, text appears as you speak, press again to stop</translation>
+    </message>
+    <message>
+        <source>音频</source>
+        <translation>Audio</translation>
+    </message>
+    <message>
+        <source>实时模式持续使用麦克风监听，不会自动静音扬声器。按住和切换模式可按下面的选项决定是否静音。</source>
+        <translation>Realtime mode keeps listening and does not mute the speakers. Hold and toggle modes can mute according to the option below.</translation>
+    </message>
+    <message>
+        <source>录音时静音系统播放</source>
+        <translation>Mute system playback while recording</translation>
+    </message>
+    <message>
+        <source>外放时开启可以减少回声；戴耳机或实时模式下建议关闭。</source>
+        <translation>Enable this on speakers to reduce echo; turn it off with headphones or in realtime mode.</translation>
+    </message>
+    <message>
+        <source>放进剪贴板的文字；输入到光标位置的也是这一段。实时模式除外：剪贴板始终保存最近一句译文。</source>
+        <translation>Text placed on the clipboard; the same text is inserted at the cursor. Realtime mode is the exception: the clipboard always holds the latest translated sentence.</translation>
+    </message>
+    <message>
+        <source>不自动清除</source>
+        <translation>Never clear automatically</translation>
+    </message>
+    <message>
+        <source>最后一次写入剪贴板后，超过这段时间自动清除。实时模式每句译文都会重新计时。</source>
+        <translation>Clear the clipboard after this long since the last write. Realtime mode restarts the timer for each sentence.</translation>
+    </message>
+    <message>
+        <source>剪贴板保留</source>
+        <translation>Keep clipboard for</translation>
+    </message>
+    <message>
+        <source>语言</source>
+        <translation>Languages</translation>
+    </message>
+    <message>
+        <source>选择我说的语言和翻译目标；模型页会跟随这里的选择。</source>
+        <translation>Choose the language you speak and the translation target; the Models page follows this choice.</translation>
+    </message>
+    <message>
+        <source>翻译设备</source>
+        <translation>Translation device</translation>
+    </message>
+    <message>
+        <source>中英互译在 GPU 上使用 Opus-MT CUDA，其他语言使用 Qwen；翻译设备与识别设备分开，更改后只重新加载翻译模型。</source>
+        <translation>Chinese↔English translation uses Opus-MT CUDA on GPU; other languages use Qwen. Translation has its own device; changing it only reloads the translation model.</translation>
+    </message>
+    <message>
+        <source>分隔符</source>
+        <translation>Separator</translation>
+    </message>
+    <message>
+        <source>原文与译文之间的分隔符，最多 8 个字符。</source>
+        <translation>Separator between original and translation, at most 8 characters.</translation>
+    </message>
+    <message>
+        <source>热词表</source>
+        <translation>Hotword table</translation>
+    </message>
+    <message>
+        <source>每行一个热词；别名用 | 分隔，增强范围 0.0 到 12.0。</source>
+        <translation>One hotword per row; separate aliases with |; boost ranges from 0.0 to 12.0.</translation>
+    </message>
+    <message>
+        <source>还没有热词。点下面的“添加热词”新增一条。</source>
+        <translation>No hotwords yet. Click “Add hotword” below to create one.</translation>
+    </message>
+    <message>
+        <source>删除所选</source>
+        <translation>Delete selected</translation>
+    </message>
+    <message>
+        <source>句尾判定</source>
+        <translation>Sentence end</translation>
+    </message>
+    <message>
+        <source>判断一句话什么时候结束；数值越大越保守，越不容易截断句子。</source>
+        <translation>Decides when a sentence ends; higher values are more conservative and less likely to cut a sentence short.</translation>
+    </message>
+    <message>
+        <source>范围 300–2000 ms。</source>
+        <translation>Range 300–2000 ms.</translation>
+    </message>
+    <message>
+        <source>检测到多长的停顿后结束当前句子。</source>
+        <translation>How long a pause ends the current sentence.</translation>
+    </message>
+    <message>
+        <source>范围 0.05–0.95。</source>
+        <translation>Range 0.05–0.95.</translation>
+    </message>
+    <message>
+        <source>越低越容易判定语音结束。</source>
+        <translation>Lower values make it easier to detect the end of speech.</translation>
+    </message>
+    <message>
+        <source>噪声判定</source>
+        <translation>Noise gate</translation>
+    </message>
+    <message>
+        <source>过滤持续背景声；数值越大越保守，越不容易被噪声触发。</source>
+        <translation>Filters sustained background noise; higher values are more conservative and less likely to trigger on noise.</translation>
+    </message>
+    <message>
+        <source>范围 -80 到 -20 dBFS。</source>
+        <translation>Range -80 to -20 dBFS.</translation>
+    </message>
+    <message>
+        <source>低于这个响度的声音按静音处理。</source>
+        <translation>Sounds below this level are treated as silence.</translation>
+    </message>
+    <message>
+        <source>范围 0 到 20 dB。</source>
+        <translation>Range 0 to 20 dB.</translation>
+    </message>
+    <message>
+        <source>高于底噪多少分贝才算人声。</source>
+        <translation>How far above the noise floor counts as speech.</translation>
+    </message>
+    <message>
+        <source>开启</source>
+        <translation>On</translation>
+    </message>
+    <message>
+        <source>按 %1 开始实时输入</source>
+        <translation>Press %1 to start realtime input</translation>
+    </message>
+    <message>
+        <source>正在实时转写...再按 %1 结束</source>
+        <translation>Transcribing in realtime... press %1 again to stop</translation>
+    </message>
+    <message>
+        <source>翻译：%1 · %2</source>
+        <translation>Translation: %1 · %2</translation>
+    </message>
+    <message>
+        <source>部分句子未翻译，已输入原文</source>
+        <translation>Some sentences were not translated; original text was inserted</translation>
     </message>
 </context>
 </TS>
