@@ -413,6 +413,68 @@ if(WIN32)
     # C libraries can open model paths that contain non-ASCII characters.
     target_link_options(sensevoice-ui PRIVATE /MANIFEST:NO)
 
+    # Dear ImGui shell. The Qt target above stays available while the
+    # immediate-mode interface reaches feature parity.
+    add_library(imgui STATIC
+        third_party/imgui/imgui.cpp
+        third_party/imgui/imgui_draw.cpp
+        third_party/imgui/imgui_tables.cpp
+        third_party/imgui/imgui_widgets.cpp
+        third_party/imgui/backends/imgui_impl_win32.cpp
+        third_party/imgui/backends/imgui_impl_dx11.cpp
+    )
+    target_include_directories(imgui PUBLIC
+        third_party/imgui
+        third_party/imgui/backends
+    )
+    target_compile_definitions(imgui PUBLIC NOMINMAX UNICODE _UNICODE)
+    target_compile_options(imgui PRIVATE /utf-8)
+    target_link_libraries(imgui PUBLIC d3d11 dxgi)
+
+    add_executable(sensevoice-ui-imgui WIN32
+        src/imgui_ui/main_imgui.cpp
+        src/imgui_ui/models_ui.cpp
+        src/imgui_ui/native_dialogs.cpp
+        src/imgui_ui/overlay_window.cpp
+        src/imgui_ui/recording_controller.cpp
+        src/imgui_ui/settings_io.cpp
+        src/imgui_ui/settings_ui.cpp
+        src/imgui_ui/theme.cpp
+        src/audio_io.cpp
+        src/languages.cpp
+        src/model_catalog.cpp
+        src/model_manager.cpp
+        src/speech_queue.cpp
+        src/speech_player.cpp
+        src/translation_session.cpp
+        src/ui/settings_types.cpp
+        src/windows_text_injector.cpp
+    )
+    target_include_directories(sensevoice-ui-imgui PRIVATE
+        src
+        third_party/FunASR/runtime/llama.cpp/funasr-common
+    )
+    target_compile_definitions(sensevoice-ui-imgui PRIVATE NOMINMAX UNICODE _UNICODE)
+    target_compile_options(sensevoice-ui-imgui PRIVATE /utf-8 /W4 /permissive-)
+    target_link_libraries(sensevoice-ui-imgui PRIVATE
+        imgui
+        sensevoice_core
+        sensevoice_translation
+        Qt6::Core
+        Qt6::Gui
+        Qt6::Network
+        ole32
+        oleaut32
+        propsys
+        psapi
+        uiautomationcore
+        uuid
+        mfplat
+        mfreadwrite
+        mfuuid
+        winmm
+    )
+
     # Verification harness for the settings dialog. It compiles the UI without
     # its entry point and links the test-only hooks in qt_ui_main.cpp.
     add_executable(settings-ui-test

@@ -78,6 +78,7 @@ private:
 
     QString bundled_directory_;
     QString legacy_directory_;
+    QString alternate_directory_;
     QString custom_directory_;
     QHash<QString, QString> custom_paths_;
     QString user_directory_;

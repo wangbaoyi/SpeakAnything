@@ -89,6 +89,12 @@ ModelManager::ModelManager(QString bundled_directory, QObject* parent)
       bundled_directory_(std::move(bundled_directory)),
       // Older builds kept their models in a sibling models/ directory.
       legacy_directory_(QFileInfo(bundled_directory_).absoluteDir().filePath(QStringLiteral("models"))),
+      // The inverse name keeps apps that switched to models/ finding an
+      // existing modelspt/ download directory without moving files.
+      alternate_directory_(QFileInfo(bundled_directory_).absoluteDir().filePath(
+          QFileInfo(bundled_directory_).fileName() == QStringLiteral("modelspt")
+              ? QStringLiteral("models")
+              : QStringLiteral("modelspt"))),
       // Fallback downloads: ~/Library/Application Support/SpeakAnything/models,
       // or %LOCALAPPDATA%/SpeakAnything/models on Windows.
       user_directory_(QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
@@ -115,6 +121,7 @@ QStringList ModelManager::searchRoots() const {
     add(bundled_directory_);
     add(custom_directory_);
     add(legacy_directory_);
+    add(alternate_directory_);
     add(user_directory_);
     add(legacy_user_directory_);
     return roots;
