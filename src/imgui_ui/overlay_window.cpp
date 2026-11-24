@@ -22,6 +22,13 @@ constexpr COLORREF kKeyColor = RGB(1, 2, 3);
 constexpr int kWidth = 560;
 constexpr int kHeight = 132;
 
+ImVec4 mix(const ImVec4& first, const ImVec4& second, float amount) {
+    return ImVec4(first.x + (second.x - first.x) * amount,
+                  first.y + (second.y - first.y) * amount,
+                  first.z + (second.z - first.z) * amount,
+                  first.w + (second.w - first.w) * amount);
+}
+
 LRESULT WINAPI overlayProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     auto* self = reinterpret_cast<OverlayWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (self != nullptr && self->imguiContext() != nullptr) {
@@ -187,6 +194,14 @@ void OverlayWindow::setCallbacks(std::function<void()> on_translate,
     on_close_ = std::move(on_close);
 }
 
+void OverlayWindow::applyTheme() {
+    if (window_ == nullptr || imgui_context_ == nullptr) return;
+    ImGuiContext* previous = ImGui::GetCurrentContext();
+    ImGui::SetCurrentContext(imgui_context_);
+    theme::applyOverlayStyle();
+    ImGui::SetCurrentContext(previous);
+}
+
 void OverlayWindow::renderFrame(float level, const std::string& status, bool listening,
                                 bool translating) {
     if (!visible_) return;
@@ -223,7 +238,8 @@ void OverlayWindow::renderFrame(float level, const std::string& status, bool lis
         const float height = 6.0f + 22.0f * level * ((index % 3) + 1) / 3.0f;
         const ImVec2 bar(bars_left + index * 6.0f, center_y - height * 0.5f);
         draw->AddRectFilled(bar, ImVec2(bar.x + 3.0f, bar.y + height),
-                            IM_COL32(198, 208, 222, 255), 1.5f);
+                            theme::u32(mix(theme::OverlayMuted, theme::OverlaySurface, 0.35f)),
+                            1.5f);
     }
 
     const ImVec2 text_pos(bars_left + 70.0f, center_y - 9.0f);
@@ -240,19 +256,22 @@ void OverlayWindow::renderFrame(float level, const std::string& status, bool lis
 
     const ImVec2 chip(io.DisplaySize.x - 190.0f, center_y - 13.0f);
     const ImVec4 chip_color = translating ? theme::Accent
-                                          : (translate_hovered ? ImVec4(0.239f, 0.286f, 0.365f, 1.0f)
-                                                               : ImVec4(0.173f, 0.212f, 0.278f, 1.0f));
+                                          : (translate_hovered
+                                                 ? ImVec4(0.145f, 0.161f, 0.224f, 1.0f)
+                                                 : theme::SurfaceSubtle);
     draw->AddRectFilled(chip, ImVec2(chip.x + 96, chip.y + 26), theme::u32(chip_color), 13.0f);
+    const ImU32 chip_text =
+        translating ? IM_COL32(255, 255, 255, 255) : theme::u32(theme::OverlayText);
     if (translating) {
-        draw->AddCircleFilled(ImVec2(chip.x + 18, chip.y + 13), 3.0f,
-                              theme::u32(theme::OverlayText));
+        draw->AddCircleFilled(ImVec2(chip.x + 18, chip.y + 13), 3.0f, chip_text);
     }
-    draw->AddText(ImVec2(chip.x + 30, chip.y + 5), theme::u32(theme::OverlayText), "翻译");
+    draw->AddText(ImVec2(chip.x + 30, chip.y + 5), chip_text, "翻译");
 
     const ImVec2 close(io.DisplaySize.x - 44.0f, center_y - 11.0f);
-    draw->AddCircleFilled(close, 11.0f,
-                          close_hovered ? IM_COL32(92, 102, 118, 255)
-                                        : IM_COL32(62, 72, 86, 255));
+    const ImVec4 close_color = close_hovered
+        ? mix(theme::OverlaySurface, theme::OverlayText, 0.18f)
+        : mix(theme::OverlaySurface, theme::OverlayText, 0.10f);
+    draw->AddCircleFilled(close, 11.0f, theme::u32(close_color));
     draw->AddText(ImVec2(close.x - 4.0f, close.y - 9.0f), theme::u32(theme::OverlayText), "×");
 
     if (close_clicked && on_close_) on_close_();

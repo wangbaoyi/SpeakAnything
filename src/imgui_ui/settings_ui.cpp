@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cfloat>
-#include <cstdio>
 #include <cstring>
 
 using namespace sa::settings;
@@ -30,7 +29,6 @@ std::string utf8FromWide(const std::wstring& text) {
 }
 
 const char* kPageTitles[8] = {"输入", "输出", "外观", "翻译", "朗读", "热词", "模型", "VAD"};
-const int kPageOrder[8] = {0, 1, 2, 3, 4, 5, 6, 7};
 
 bool inputText(const char* label, std::string& value, std::size_t capacity = 256) {
     char buffer[512] = {};
@@ -71,7 +69,7 @@ bool comboCompute(const char* label, ComputePolicy* policy) {
     return false;
 }
 
-constexpr float kLabelWidth = 150.0f;
+constexpr float kLabelWidth = 130.0f;
 
 std::string hiddenId(const char* label) {
     return std::string("##") + label;
@@ -120,7 +118,9 @@ void cardTitle(const char* text) {
 }
 
 void hint(const char* text) {
-    ImGui::TextColored(theme::TextMuted, "%s", text);
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::TextMuted);
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
 }
 
 void beginCard(const char* id) {
@@ -140,13 +140,19 @@ void endCard() {
     ImGui::Spacing();
 }
 
+void beginGrid(const char* id, int columns) { ImGui::BeginTable(id, columns, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings); ImGui::TableNextColumn(); }
+#define nextCell() ImGui::TableNextColumn()
+void endGrid() { ImGui::EndTable(); ImGui::Spacing(); }
+
 void drawInputPage(SettingsState& state) {
+    beginGrid("input_grid", 2);
     beginCard("input_compute_card");
     cardTitle("计算设备");
     hint("自动在 GPU 可用时使用 GPU，否则使用 CPU。更改设备后重新加载识别模型。");
     rowComboCompute("识别设备", &state.draft.compute);
     endCard();
 
+    nextCell();
     beginCard("input_shortcut_card");
     cardTitle("快捷键");
     std::string shortcut = state.draft.shortcut.toStdString();
@@ -157,6 +163,7 @@ void drawInputPage(SettingsState& state) {
     hint("示例：Ctrl+Alt+Space。录入后按“应用”生效。");
     endCard();
 
+    nextCell();
     beginCard("input_trigger_card");
     cardTitle("触发方式");
     static const char* triggers[] = {"按住说话", "按一下切换", "实时模式"};
@@ -167,6 +174,7 @@ void drawInputPage(SettingsState& state) {
     }
     endCard();
 
+    nextCell();
     beginCard("input_audio_card");
     cardTitle("音频与启动");
     if (ImGui::Checkbox("录音时静音系统播放", &state.draft.mute_while_recording)) {
@@ -176,6 +184,7 @@ void drawInputPage(SettingsState& state) {
         state.dirty = true;
     }
     endCard();
+    endGrid();
 }
 
 void drawOutputPage(SettingsState& state) {
@@ -227,8 +236,11 @@ void drawOutputPage(SettingsState& state) {
     endCard();
 }
 
+void markAppearance(SettingsState& state) { state.dirty = true; if (state.appearance_changed) state.appearance_changed(); }
+
 void drawAppearancePage(SettingsState& state) {
     hint("外观修改即时生效，关闭窗口不会撤回。");
+    beginGrid("appearance_grid", 2);
     AppearanceSettings& appearance = state.snapshot.appearance;
     beginCard("appearance_theme_card");
     cardTitle("配色主题");
@@ -236,12 +248,19 @@ void drawAppearancePage(SettingsState& state) {
     int preset = static_cast<int>(appearance.preset);
     if (rowCombo("主题", &preset, themes, 5)) {
         appearance.preset = static_cast<ThemePreset>(preset);
-        state.dirty = true;
+        if (appearance.preset == ThemePreset::Custom) {
+            appearance.custom.background = QColor::fromRgbF(theme::Background.x, theme::Background.y, theme::Background.z);
+            appearance.custom.text = QColor::fromRgbF(theme::TextPrimary.x, theme::TextPrimary.y, theme::TextPrimary.z);
+            appearance.custom.accent = QColor::fromRgbF(theme::Accent.x, theme::Accent.y, theme::Accent.z);
+        }
+        markAppearance(state);
     }
     endCard();
 
+    nextCell();
     beginCard("appearance_color_card");
-    cardTitle("颜色");
+    cardTitle("自定义颜色");
+    hint("仅在“自定义”主题下生效；选择预设主题时使用预设配色。");
     float background[3] = {appearance.custom.background.redF(), appearance.custom.background.greenF(),
                            appearance.custom.background.blueF()};
     float text[3] = {appearance.custom.text.redF(), appearance.custom.text.greenF(),
@@ -260,46 +279,51 @@ void drawAppearancePage(SettingsState& state) {
         appearance.custom.background = QColor::fromRgbF(background[0], background[1], background[2]);
         appearance.custom.text = QColor::fromRgbF(text[0], text[1], text[2]);
         appearance.custom.accent = QColor::fromRgbF(accent[0], accent[1], accent[2]);
-        state.dirty = true;
+        markAppearance(state);
     }
     endCard();
 
+    nextCell();
     beginCard("appearance_font_card");
     cardTitle("字体");
     std::string family = appearance.custom_font_family.toStdString();
     if (rowInputText("字体", family, 128)) {
         appearance.custom_font_family = QString::fromStdString(family);
         appearance.preset = ThemePreset::Custom;
-        state.dirty = true;
+        markAppearance(state);
     }
     if (rowSliderInt("字号", &appearance.custom_font_size, 8, 24)) {
         appearance.preset = ThemePreset::Custom;
-        state.dirty = true;
+        markAppearance(state);
     }
     endCard();
 
+    nextCell();
     beginCard("appearance_display_card");
     cardTitle("浮窗显示");
     int linger = appearance.linger_ms;
     if (rowSliderInt("停留时长（ms）", &linger, 0, linger_maximum_ms)) {
         appearance.linger_ms = (linger / linger_step_ms) * linger_step_ms;
-        state.dirty = true;
+        markAppearance(state);
     }
     if (ImGui::Checkbox("常驻显示", &appearance.pinned)) {
-        state.dirty = true;
+        markAppearance(state);
     }
     hint("常驻显示时，唤出后不自动隐藏，点浮窗上的 × 关闭。");
     endCard();
+    endGrid();
 }
 
 void drawTranslationPage(SettingsState& state) {
     TranslationSettings& translation = state.draft.translation;
+    beginGrid("translation_grid", 2);
     beginCard("translation_mode_card");
     cardTitle("翻译");
     if (ImGui::Checkbox("开启翻译模式", &translation.enabled)) state.dirty = true;
     hint("开启后，原文和译文会一起写入光标位置。");
     endCard();
 
+    nextCell();
     beginCard("translation_language_card");
     cardTitle("语言");
     rowComboStrings("我说的语言", &state.source_language, state.language_labels);
@@ -310,12 +334,14 @@ void drawTranslationPage(SettingsState& state) {
     }
     endCard();
 
+    nextCell();
     beginCard("translation_device_card");
     cardTitle("翻译设备");
     rowComboCompute("计算设备", &translation.device);
     hint("中英互译在 GPU 上使用 Opus-MT CUDA，其他语言使用 Qwen。");
     endCard();
 
+    nextCell();
     beginCard("translation_separator_card");
     cardTitle("分隔符");
     std::string separator = translation.separator.toStdString();
@@ -326,16 +352,19 @@ void drawTranslationPage(SettingsState& state) {
     ImGui::Text("示例：今天开会。%sWe have a meeting today.",
                 translation.separator.toUtf8().constData());
     endCard();
+    endGrid();
 }
 
 void drawSpeechPage(SettingsState& state) {
     SpeechSettings& speech = state.draft.speech;
+    beginGrid("speech_grid", 2);
     beginCard("speech_mode_card");
     cardTitle("朗读");
     if (ImGui::Checkbox("开启朗读", &speech.enabled)) state.dirty = true;
     if (ImGui::Checkbox("边说边朗读", &speech.live)) state.dirty = true;
     endCard();
 
+    nextCell();
     beginCard("speech_device_card");
     cardTitle("朗读设备");
     rowComboStrings("设备", &state.speech_device, state.speech_devices);
@@ -344,6 +373,7 @@ void drawSpeechPage(SettingsState& state) {
     }
     endCard();
 
+    nextCell();
     beginCard("speech_voice_card");
     cardTitle("声音与语速");
     static const char* voices[] = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
@@ -359,6 +389,7 @@ void drawSpeechPage(SettingsState& state) {
     }
     if (rowSliderInt("语速（%）", &speech.speed_percent, 50, 200)) state.dirty = true;
     endCard();
+    endGrid();
 }
 
 void drawHotwordPage(SettingsState& state) {
@@ -432,40 +463,9 @@ void drawHotwordPage(SettingsState& state) {
     endCard();
 }
 
-void drawModelsPage(SettingsState& state) {
-    if (state.models_ui != nullptr) {
-        state.models_ui->draw();
-        return;
-    }
-    beginCard("models_directory_card");
-    cardTitle("模型目录");
-    ImGui::TextWrapped("当前目录：%s",
-                       state.snapshot.model_choices.custom_directory.isEmpty()
-                           ? "可执行目录下的 modelspt"
-                           : state.snapshot.model_choices.custom_directory.toUtf8().constData());
-    hint("模型下载、导入和删除将在下一阶段接入 ModelManager。");
-    endCard();
-
-    beginCard("models_recognizer_card");
-    cardTitle("语音识别");
-    ImGui::Text("当前选择：%s",
-                state.snapshot.model_choices.recognizer.value("zh", "auto").toUtf8().constData());
-    endCard();
-
-    beginCard("models_translator_card");
-    cardTitle("翻译");
-    ImGui::Text("当前选择：%s", state.snapshot.model_choices.translator.toUtf8().constData());
-    endCard();
-
-    beginCard("models_voice_card");
-    cardTitle("朗读声音");
-    ImGui::Text("当前选择：%s",
-                state.snapshot.model_choices.voice.value("en", "auto").toUtf8().constData());
-    endCard();
-}
-
 void drawVadPage(SettingsState& state) {
     VadSettings& vad = state.draft.vad;
+    beginGrid("vad_grid", 2);
     beginCard("vad_sentence_card");
     cardTitle("句尾判定");
     rowSliderInt("句尾静音（ms）", &vad.endpoint_ms, 300, 2000);
@@ -474,6 +474,7 @@ void drawVadPage(SettingsState& state) {
     hint("越低越容易判定语音结束。");
     endCard();
 
+    nextCell();
     beginCard("vad_noise_card");
     cardTitle("噪声判定");
     rowSliderInt("最低响度（dBFS）", &vad.minimum_db, -80, -20);
@@ -481,6 +482,7 @@ void drawVadPage(SettingsState& state) {
     rowSliderInt("底噪余量（dB）", &vad.snr_db, 0, 20);
     hint("高于底噪多少分贝才算人声。");
     endCard();
+    endGrid();
 }
 
 void drawPage(SettingsState& state) {
@@ -491,7 +493,9 @@ void drawPage(SettingsState& state) {
     case 3: drawTranslationPage(state); break;
     case 4: drawSpeechPage(state); break;
     case 5: drawHotwordPage(state); break;
-    case 6: drawModelsPage(state); break;
+    case 6:
+        if (state.models_ui != nullptr) state.models_ui->draw();
+        break;
     case 7: drawVadPage(state); break;
     default: break;
     }
@@ -546,13 +550,15 @@ void draw(SettingsState& state) {
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_ChildBg, theme::Sidebar);
     ImGui::PushStyleColor(ImGuiCol_Border, theme::Border);
-    ImGui::BeginChild("nav", ImVec2(184, -60), ImGuiChildFlags_Borders);
+    ImGui::BeginChild("nav", ImVec2(184, -96), ImGuiChildFlags_Borders);
     ImDrawList* nav_draw = ImGui::GetWindowDrawList();
     for (int index = 0; index < 8; ++index) {
         const bool selected = state.page == index;
-        if (ImGui::Selectable(kPageTitles[kPageOrder[index]], selected)) {
+        if (selected) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.816f, 0.871f, 1.0f));
+        if (ImGui::Selectable(kPageTitles[index], selected)) {
             state.page = index;
         }
+        if (selected) ImGui::PopStyleColor();
         if (selected) {
             const ImVec2 minimum = ImGui::GetItemRectMin();
             const ImVec2 maximum = ImGui::GetItemRectMax();
@@ -564,10 +570,10 @@ void draw(SettingsState& state) {
     ImGui::EndChild();
     ImGui::PopStyleColor(2);
     ImGui::SameLine();
-    ImGui::BeginChild("content", ImVec2(0, -60));
+    ImGui::BeginChild("content", ImVec2(0, -96));
     ImGui::TextColored(theme::TextPrimary, "%s", kPageTitles[state.page]);
     ImGui::Separator();
-    ImGui::BeginChild("scroll", ImVec2(0, -34));
+    ImGui::BeginChild("scroll", ImVec2(0, -68));
     drawPage(state);
     ImGui::EndChild();
     ImGui::Separator();

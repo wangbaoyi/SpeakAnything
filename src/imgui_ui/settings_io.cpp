@@ -124,4 +124,23 @@ void saveTranslationEnabled(bool enabled) {
     settings.sync();
 }
 
+void saveAppearance(const sa::settings::AppearanceSettings& appearance) {
+    QSettings settings(QStringLiteral("SenseVoice"), QStringLiteral("LocalDictation"));
+    settings.setValue(QStringLiteral("appearance/preset"),
+                      sa::settings::themePresetName(appearance.preset));
+    settings.setValue(QStringLiteral("appearance/custom_background"),
+                      appearance.custom.background.name());
+    settings.setValue(QStringLiteral("appearance/custom_text"),
+                      appearance.custom.text.name());
+    settings.setValue(QStringLiteral("appearance/custom_accent"),
+                      appearance.custom.accent.name());
+    settings.setValue(QStringLiteral("appearance/custom_font_family"),
+                      appearance.custom_font_family);
+    settings.setValue(QStringLiteral("appearance/custom_font_size"),
+                      appearance.custom_font_size);
+    settings.setValue(QStringLiteral("appearance/linger_ms"), appearance.linger_ms);
+    settings.setValue(QStringLiteral("appearance/pinned"), appearance.pinned);
+    settings.sync();
+}
+
 } // namespace sa::imgui_ui

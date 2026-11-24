@@ -26,6 +26,7 @@ public:
     [[nodiscard]] ImGuiContext* imguiContext() const { return imgui_context_; }
 
     void setCallbacks(std::function<void()> on_translate, std::function<void()> on_close);
+    void applyTheme();
 
     // Render one frame. level is 0..1, status is UTF-8.
     void renderFrame(float level, const std::string& status, bool listening, bool translating);

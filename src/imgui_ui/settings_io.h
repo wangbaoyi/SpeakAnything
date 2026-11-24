@@ -11,5 +11,6 @@ void loadSettings(SettingsState& state, const std::filesystem::path& hotwords_pa
 bool saveSettings(const SettingsState& state, const std::filesystem::path& hotwords_path,
                   std::string* error = nullptr);
 void saveTranslationEnabled(bool enabled);
+void saveAppearance(const sa::settings::AppearanceSettings& appearance);
 
 } // namespace sa::imgui_ui

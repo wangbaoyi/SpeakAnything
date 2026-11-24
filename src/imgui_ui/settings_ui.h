@@ -3,6 +3,7 @@
 #include "ui/settings_types.h"
 
 #include <string>
+#include <functional>
 #include <vector>
 
 namespace sa::imgui_ui {
@@ -22,6 +23,7 @@ struct SettingsState {
     bool apply_requested = false;
     std::string message;
     ModelsUi* models_ui = nullptr;
+    std::function<void()> appearance_changed;
     std::vector<std::string> language_labels;
     std::vector<std::string> language_codes;
     std::vector<std::string> speech_devices;

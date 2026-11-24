@@ -3,6 +3,15 @@
 The interface is moving from Qt Widgets to Dear ImGui. The existing Qt target
 stays available while the immediate-mode interface reaches feature parity.
 
+Visual language follows WhaleTalk's dark UI: near-black canvas `#090B11`,
+translucent panels `#171B26`, hairline borders, 14 px rounded cards, pink accent
+`#FF6F9C`/`#FB4D86`, and two-column card grids for settings pages.
+
+Themes: 默认 (WhaleTalk dark/pink), 亮色, 暗色 (blue accent), 高对比度 and
+自定义. Selecting a theme in 外观 applies it immediately to both the settings
+window and the overlay, and saves it to QSettings. 自定义 derives all surfaces
+and borders from the user's background/text/accent colors.
+
 ## Current state
 
 Implemented in `sensevoice-ui-imgui`:
@@ -72,6 +81,7 @@ Diagnostics:
 | `SPEAKANYTHING_IMGUI_TRANSCRIPT=1` | Append recognized/translated text to `imgui-transcript.log` |
 | `SPEAKANYTHING_IMGUI_PAGE=<0-7>` | Open the settings window on a specific page |
 | `SPEAKANYTHING_IMGUI_SPEAK=1` | Force speech playback on for this run |
+| `SPEAKANYTHING_IMGUI_THEME=light\|dark\|high\|custom` | Preview a theme for this run |
 
 ## Layout
 

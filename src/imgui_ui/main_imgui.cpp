@@ -306,6 +306,40 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         std::filesystem::path(executable).parent_path() / L"hotwords.tsv";
     sa::imgui_ui::loadSettings(state, hotwords_path);
     sa::imgui_ui::initialize(state);
+    state.appearance_changed = [&state] {
+        sa::imgui_ui::saveAppearance(state.snapshot.appearance);
+    };
+    wchar_t theme_value[32] = {};
+    if (GetEnvironmentVariableW(L"SPEAKANYTHING_IMGUI_THEME", theme_value, 32) > 0) {
+        if (std::wcscmp(theme_value, L"light") == 0) {
+            state.snapshot.appearance.preset = sa::settings::ThemePreset::Light;
+        } else if (std::wcscmp(theme_value, L"dark") == 0) {
+            state.snapshot.appearance.preset = sa::settings::ThemePreset::Dark;
+        } else if (std::wcscmp(theme_value, L"high") == 0) {
+            state.snapshot.appearance.preset = sa::settings::ThemePreset::HighContrast;
+        } else if (std::wcscmp(theme_value, L"custom") == 0) {
+            state.snapshot.appearance.preset = sa::settings::ThemePreset::Custom;
+        }
+    }
+    sa::settings::ThemePreset applied_preset = state.snapshot.appearance.preset;
+    sa::settings::ThemeColors applied_custom = state.snapshot.appearance.custom;
+    bool theme_initialized = false;
+    const auto syncTheme = [&] {
+        const sa::settings::AppearanceSettings& appearance = state.snapshot.appearance;
+        const bool changed = !theme_initialized || appearance.preset != applied_preset ||
+            appearance.custom.background != applied_custom.background ||
+            appearance.custom.text != applied_custom.text ||
+            appearance.custom.accent != applied_custom.accent;
+        if (!changed) return;
+        applied_preset = appearance.preset;
+        applied_custom = appearance.custom;
+        theme_initialized = true;
+        sa::imgui_ui::theme::setTheme(appearance.preset, appearance.custom);
+        ImGui::SetCurrentContext(g_imgui_context);
+        sa::imgui_ui::theme::applySettingsStyle();
+        g_overlay.applyTheme();
+    };
+    syncTheme();
     wchar_t page_value[8] = {};
     if (GetEnvironmentVariableW(L"SPEAKANYTHING_IMGUI_PAGE", page_value, 8) > 0) {
         state.page = std::clamp(_wtoi(page_value), 0, 7);
@@ -441,6 +475,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         }
         if (!g_running) break;
         QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        syncTheme();
 
         if (IsWindowVisible(g_window)) {
             ImGui::SetCurrentContext(g_imgui_context);
